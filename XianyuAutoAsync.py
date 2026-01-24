@@ -5197,6 +5197,11 @@ class XianyuLive:
 
                     # 插入或更新订单信息到数据库
                     try:
+                        # 过滤掉买家订单（如果buyer_id是自己，说明是自己购买的订单）
+                        if buyer_id and buyer_id == self.myid:
+                            logger.info(f"【{self.cookie_id}】跳过买家订单 {order_id}，buyer_id={buyer_id} 等于自己的ID")
+                            return result  # 直接返回，不保存买家订单
+
                         # 检查cookie_id是否在cookies表中存在
                         cookie_info = db_manager.get_cookie_by_id(self.cookie_id)
                         if not cookie_info:
@@ -5475,28 +5480,33 @@ class XianyuLive:
                 try:
                     from db_manager import db_manager
 
-                    # 检查cookie_id是否在cookies表中存在
-                    cookie_info = db_manager.get_cookie_by_id(self.cookie_id)
-                    if not cookie_info:
-                        logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
+                    # 过滤掉买家订单（如果send_user_id是自己，说明是自己购买的订单）
+                    if send_user_id and send_user_id == self.myid:
+                        logger.info(f"【{self.cookie_id}】跳过买家订单 {order_id}，buyer_id={send_user_id} 等于自己的ID")
+                        # 不保存买家订单，但继续返回发货内容（如果有的话）
                     else:
-                        existing_order = db_manager.get_order_by_id(order_id)
-                        if not existing_order:
-                            # 插入基本订单信息
-                            success = db_manager.insert_or_update_order(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=send_user_id,
-                                cookie_id=self.cookie_id
-                            )
-                            
-                            # 使用订单状态处理器设置状态
-                            if success and self.order_status_handler:
-                                try:
-                                    self.order_status_handler.handle_order_basic_info_status(
-                                        order_id=order_id,
-                                        cookie_id=self.cookie_id,
-                                        context="自动发货-基本信息"
+                        # 检查cookie_id是否在cookies表中存在
+                        cookie_info = db_manager.get_cookie_by_id(self.cookie_id)
+                        if not cookie_info:
+                            logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
+                        else:
+                            existing_order = db_manager.get_order_by_id(order_id)
+                            if not existing_order:
+                                # 插入基本订单信息
+                                success = db_manager.insert_or_update_order(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=send_user_id,
+                                    cookie_id=self.cookie_id
+                                )
+
+                                # 使用订单状态处理器设置状态
+                                if success and self.order_status_handler:
+                                    try:
+                                        self.order_status_handler.handle_order_basic_info_status(
+                                            order_id=order_id,
+                                            cookie_id=self.cookie_id,
+                                            context="自动发货-基本信息"
                                     )
                                 except Exception as e:
                                     logger.error(f"【{self.cookie_id}】订单状态处理器调用失败: {self._safe_str(e)}")

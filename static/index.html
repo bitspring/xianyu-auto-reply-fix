@@ -686,10 +686,13 @@
             <select class="form-select" id="orderStatusFilter" onchange="filterOrders()">
               <option value="">所有状态</option>
               <option value="processing">处理中</option>
-              <option value="processed">已处理</option>
+              <option value="pending_payment">待付款</option>
+              <option value="pending_delivery">待发货</option>
               <option value="shipped">已发货</option>
-              <option value="completed">已完成</option>
-              <option value="cancelled">已关闭</option>
+              <option value="success">交易成功</option>
+              <option value="refunding">退款中</option>
+              <option value="refunded">退款成功</option>
+              <option value="closed">交易关闭</option>
               <option value="unknown">未知</option>
             </select>
           </div>
@@ -714,9 +717,14 @@
                      placeholder="搜索订单ID或商品ID..." style="width: 300px;">
               <h5 class="mb-0">订单列表</h5>
             </div>
-            <button class="btn btn-sm btn-outline-danger" onclick="batchDeleteOrders()" id="batchDeleteOrdersBtn" disabled>
-              <i class="bi bi-trash"></i> 批量删除
-            </button>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary" onclick="batchRefreshOrders()" id="batchRefreshOrdersBtn" disabled>
+                <i class="bi bi-arrow-clockwise"></i> 批量刷新
+              </button>
+              <button class="btn btn-sm btn-outline-danger" onclick="batchDeleteOrders()" id="batchDeleteOrdersBtn" disabled>
+                <i class="bi bi-trash"></i> 批量删除
+              </button>
+            </div>
           </div>
           <div class="card-body">
             <!-- 搜索统计信息 -->

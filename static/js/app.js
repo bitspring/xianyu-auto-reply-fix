@@ -9949,9 +9949,13 @@ function createOrderRow(order) {
 function getOrderStatusClass(status) {
     const statusMap = {
         'processing': 'bg-warning text-dark',
-        'processed': 'bg-info text-white',
-        'completed': 'bg-success text-white',
-        'cancelled': 'bg-danger text-white',
+        'pending_payment': 'bg-warning text-dark',
+        'pending_delivery': 'bg-info text-white',
+        'shipped': 'bg-primary text-white',
+        'success': 'bg-success text-white',
+        'refunding': 'bg-warning text-dark',
+        'refunded': 'bg-danger text-white',
+        'closed': 'bg-secondary text-white',
         'unknown': 'bg-secondary text-white'
     };
     return statusMap[status] || 'bg-secondary text-white';
@@ -9961,13 +9965,16 @@ function getOrderStatusClass(status) {
 function getOrderStatusText(status) {
     const statusMap = {
         'processing': '处理中',
-        'processed': '已处理',
+        'pending_payment': '待付款',
+        'pending_delivery': '待发货',
         'shipped': '已发货',
-        'completed': '已完成',
-        'cancelled': '已关闭',
+        'success': '交易成功',
+        'refunding': '退款中',
+        'refunded': '退款成功',
+        'closed': '交易关闭',
         'unknown': '未知'
     };
-    return statusMap[status] || '未知';
+    return statusMap[status] || status || '未知';
 }
 
 // 更新订单分页
@@ -10398,7 +10405,7 @@ async function refreshOrderStatus(orderId) {
 
         if (response.ok) {
             if (result.updated) {
-                showToast(`订单状态已更新: ${result.new_status}`, 'success');
+                showToast(`订单状态已更新: ${getOrderStatusText(result.new_status)}`, 'success');
             } else {
                 showToast(result.message || '订单状态无变化', 'info');
             }
@@ -10420,16 +10427,71 @@ function toggleSelectAllOrders(checkbox) {
         cb.checked = checkbox.checked;
     });
 
-    updateBatchDeleteOrdersButton();
+    updateOrderBatchButtons();
 }
 
-// 更新批量删除按钮状态
-function updateBatchDeleteOrdersButton() {
+// 更新批量操作按钮状态
+function updateOrderBatchButtons() {
     const checkboxes = document.querySelectorAll('.order-checkbox:checked');
     const batchDeleteBtn = document.getElementById('batchDeleteOrdersBtn');
+    const batchRefreshBtn = document.getElementById('batchRefreshOrdersBtn');
+
+    const hasSelection = checkboxes.length > 0;
 
     if (batchDeleteBtn) {
-        batchDeleteBtn.disabled = checkboxes.length === 0;
+        batchDeleteBtn.disabled = !hasSelection;
+    }
+    if (batchRefreshBtn) {
+        batchRefreshBtn.disabled = !hasSelection;
+    }
+}
+
+// 批量刷新订单状态
+async function batchRefreshOrders() {
+    const checkboxes = document.querySelectorAll('.order-checkbox:checked');
+    if (checkboxes.length === 0) {
+        showToast('请先选择要刷新的订单', 'warning');
+        return;
+    }
+
+    const orderIds = Array.from(checkboxes).map(cb => cb.value);
+    const confirmed = confirm(`确定要刷新选中的 ${orderIds.length} 个订单状态吗？\n\n这可能需要一些时间...`);
+
+    if (!confirmed) return;
+
+    showToast(`正在刷新 ${orderIds.length} 个订单状态...`, 'info');
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const orderId of orderIds) {
+        try {
+            const response = await fetch(`${apiBase}/api/orders/${orderId}/refresh`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${authToken}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (response.ok) {
+                successCount++;
+            } else {
+                failCount++;
+            }
+        } catch (error) {
+            console.error(`刷新订单 ${orderId} 失败:`, error);
+            failCount++;
+        }
+    }
+
+    // 刷新订单列表
+    await refreshOrdersData();
+
+    if (failCount === 0) {
+        showToast(`成功刷新 ${successCount} 个订单状态`, 'success');
+    } else {
+        showToast(`刷新完成: ${successCount} 成功, ${failCount} 失败`, 'warning');
     }
 }
 
@@ -10443,7 +10505,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // 绑定复选框变化事件
         document.addEventListener('change', function(e) {
             if (e.target.classList.contains('order-checkbox')) {
-                updateBatchDeleteOrdersButton();
+                updateOrderBatchButtons();
             }
         });
     }, 100);

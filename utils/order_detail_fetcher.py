@@ -197,13 +197,14 @@ class OrderDetailFetcher:
         except Exception as e:
             logger.error(f"设置Cookie失败: {e}")
 
-    async def fetch_order_detail(self, order_id: str, timeout: int = 30) -> Optional[Dict[str, Any]]:
+    async def fetch_order_detail(self, order_id: str, timeout: int = 30, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """
         获取订单详情（带锁机制和数据库缓存）
 
         Args:
             order_id: 订单ID
             timeout: 超时时间（秒）
+            force_refresh: 是否强制刷新（跳过缓存直接从闲鱼获取）
 
         Returns:
             包含订单详情的字典，失败时返回None
@@ -215,54 +216,57 @@ class OrderDetailFetcher:
             logger.info(f"🔒 获取订单 {order_id} 的锁，开始处理...")
 
             try:
-                # 首先查询数据库中是否已存在该订单（在初始化浏览器之前）
-                from db_manager import db_manager
-                existing_order = db_manager.get_order_by_id(order_id)
+                # 如果不是强制刷新，先查询数据库缓存
+                if not force_refresh:
+                    from db_manager import db_manager
+                    existing_order = db_manager.get_order_by_id(order_id)
 
-                if existing_order:
-                    # 检查金额字段是否有效（不为空且不为0）
-                    amount = existing_order.get('amount', '')
-                    amount_valid = False
+                    if existing_order:
+                        # 检查金额字段是否有效（不为空且不为0）
+                        amount = existing_order.get('amount', '')
+                        amount_valid = False
 
-                    if amount:
-                        # 移除可能的货币符号和空格，检查是否为有效数字
-                        amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                        try:
-                            amount_value = float(amount_clean)
-                            amount_valid = amount_value > 0
-                        except (ValueError, TypeError):
-                            amount_valid = False
+                        if amount:
+                            # 移除可能的货币符号和空格，检查是否为有效数字
+                            amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
+                            try:
+                                amount_value = float(amount_clean)
+                                amount_valid = amount_value > 0
+                            except (ValueError, TypeError):
+                                amount_valid = False
 
-                    if amount_valid:
-                        logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
-                        print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
+                        if amount_valid:
+                            logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
+                            print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
-                        # 构建返回格式，与浏览器获取的格式保持一致
-                        result = {
-                            'order_id': existing_order['order_id'],
-                            'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
-                            'title': f"订单详情 - {order_id}",
-                            'sku_info': {
+                            # 构建返回格式，与浏览器获取的格式保持一致
+                            result = {
+                                'order_id': existing_order['order_id'],
+                                'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
+                                'title': f"订单详情 - {order_id}",
+                                'sku_info': {
+                                    'spec_name': existing_order.get('spec_name', ''),
+                                    'spec_value': existing_order.get('spec_value', ''),
+                                    'spec_name_2': existing_order.get('spec_name_2', ''),
+                                    'spec_value_2': existing_order.get('spec_value_2', ''),
+                                    'quantity': existing_order.get('quantity', ''),
+                                    'amount': existing_order.get('amount', '')
+                                },
                                 'spec_name': existing_order.get('spec_name', ''),
                                 'spec_value': existing_order.get('spec_value', ''),
                                 'spec_name_2': existing_order.get('spec_name_2', ''),
                                 'spec_value_2': existing_order.get('spec_value_2', ''),
                                 'quantity': existing_order.get('quantity', ''),
-                                'amount': existing_order.get('amount', '')
-                            },
-                            'spec_name': existing_order.get('spec_name', ''),
-                            'spec_value': existing_order.get('spec_value', ''),
-                            'spec_name_2': existing_order.get('spec_name_2', ''),
-                            'spec_value_2': existing_order.get('spec_value_2', ''),
-                            'quantity': existing_order.get('quantity', ''),
-                            'amount': existing_order.get('amount', ''),
-                            'timestamp': time.time(),
-                            'from_cache': True  # 标记数据来源
-                        }
-                        return result
-                    else:
-                        logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                        print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                                'amount': existing_order.get('amount', ''),
+                                'timestamp': time.time(),
+                                'from_cache': True  # 标记数据来源
+                            }
+                            return result
+                        else:
+                            logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
+                            print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                else:
+                    logger.info(f"🔄 订单 {order_id} 强制刷新模式，跳过缓存检查")
 
                 # 只有在数据库中没有有效数据时才初始化浏览器
                 logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
@@ -876,7 +880,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
     fetcher = OrderDetailFetcher(cookie_string, headless)
     try:
         if await fetcher.init_browser(headless=headless):
-            return await fetcher.fetch_order_detail(order_id)
+            return await fetcher.fetch_order_detail(order_id, force_refresh=force_refresh)
     finally:
         await fetcher.close()
     return None
