@@ -5507,9 +5507,9 @@ class XianyuLive:
                                             order_id=order_id,
                                             cookie_id=self.cookie_id,
                                             context="自动发货-基本信息"
-                                    )
-                                except Exception as e:
-                                    logger.error(f"【{self.cookie_id}】订单状态处理器调用失败: {self._safe_str(e)}")
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"【{self.cookie_id}】订单状态处理器调用失败: {self._safe_str(e)}")
                             
                             if success:
                                 logger.info(f"保存基本订单信息到数据库: {order_id}")
