@@ -12332,7 +12332,7 @@ let remoteVersionInfo = null;
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
     version: 'v1.1.0',
-    intro: '此版本为本人利用业余时间开发，功能可能不完善，欢迎大家提出建议和bug，我会尽快修复。此版本纯粹免费，没有任何收费项目，请大家放心使用。',
+    intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
         {
             version: 'v1.1.0',
