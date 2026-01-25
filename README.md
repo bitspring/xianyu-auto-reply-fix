@@ -1,14 +1,14 @@
 # 🐟 闲鱼自动回复系统
 
-[![GitHub](https://img.shields.io/badge/GitHub-zhinianboke%2Fxianyu--auto--reply-blue?logo=github)](https://github.com/zhinianboke/xianyu-auto-reply)
-[![Docker](https://img.shields.io/badge/Docker-一键部署-blue?logo=docker)](https://github.com/zhinianboke/xianyu-auto-reply#-快速开始)
+[![GitHub](https://img.shields.io/badge/GitHub-GuDong2003%2Fxianyu--auto--reply--fix-blue?logo=github)](https://github.com/GuDong2003/xianyu-auto-reply-fix)
+[![Docker](https://img.shields.io/badge/Docker-暂不可用-blue?logo=docker)](https://github.com/zhinianboke/xianyu-auto-reply#-快速开始)
 [![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-仅供学习-red.svg)](#️-版权声明与使用条款)
 
 ## 最新代码获取地址（尽量转存）
 
-我用夸克网盘分享了「自动发货」，点击链接即可保存。打开「夸克APP」，无需下载在线播放视频，畅享原画5倍速，支持电视投屏。
-链接：https://pan.quark.cn/s/447e909f4107
+~~我用夸克网盘分享了「自动发货」，点击链接即可保存。打开「夸克APP」，无需下载在线播放视频，畅享原画5倍速，支持电视投屏。
+链接：https://pan.quark.cn/s/447e909f4107~~
 
 ## 📋 项目概述
 
