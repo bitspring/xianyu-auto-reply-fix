@@ -131,10 +131,15 @@ class SecureConfirm:
 
         try:
             logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
+
+            # 设置请求超时
+            request_timeout = aiohttp.ClientTimeout(total=30)
+
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
                 params=params,
-                data=data
+                data=data,
+                timeout=request_timeout
             ) as response:
                 res_json = await response.json()
 

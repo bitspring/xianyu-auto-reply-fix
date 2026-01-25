@@ -1,5 +1,6 @@
 import asyncio
 import time
+import aiohttp
 from loguru import logger
 from utils.xianyu_utils import trans_cookies, generate_sign
 
@@ -81,10 +82,15 @@ class SecureFreeshipping:
 
         try:
             logger.info(f"【{self.cookie_id}】开始自动免拼发货，订单ID: {order_id}")
+
+            # 设置请求超时
+            request_timeout = aiohttp.ClientTimeout(total=30)
+
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.idle.groupon.activity.seller.freeshipping/1.0/',
                 params=params,
-                data=data
+                data=data,
+                timeout=request_timeout
             ) as response:
                 res_json = await response.json()
 
