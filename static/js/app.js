@@ -12714,7 +12714,7 @@ const LOCAL_VERSION_HISTORY = {
         },
         {
             version: 'v1.1.0',
-            date: '2025-01-25',
+            date: '2026-01-25',
             updates: [
                 '添加登录页面验证码开关功能',
                 '优化订单管理功能',
@@ -12725,7 +12725,7 @@ const LOCAL_VERSION_HISTORY = {
         },
         {
             version: 'v1.0.0',
-            date: '2025-01-24',
+            date: '2026-01-24',
             updates: [
                 '闲鱼自动回复系统初始版本'
             ]
