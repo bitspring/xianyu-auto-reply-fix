@@ -12665,7 +12665,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.0.0';
+const DEFAULT_VERSION = 'v1.1.3';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -12678,12 +12678,32 @@ let remoteVersionInfo = null;
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.1.1',
+    version: 'v1.1.3',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
         {
+            version: 'v1.1.3',
+            date: '2026-01-27',
+            updates: [
+                '【系统设置】优化"登录与注册设置"卡片布局',
+                '【系统设置】增大各选项间距，提升视觉体验',
+                '【系统设置】保存按钮使用大号样式并占满卡片宽度',
+                '【系统设置】状态提示移至按钮上方显示'
+            ]
+        },
+        {
+            version: 'v1.1.2',
+            date: '2026-01-27',
+            updates: [
+                '【在线客服】修复页面底部白色空白区域问题',
+                '【系统设置】重新组织页面布局（两行两列）',
+                '【系统设置】合并"注册设置"到"登录与注册设置"',
+                '【侧边栏】优化折叠功能'
+            ]
+        },
+        {
             version: 'v1.1.1',
-            date: '2025-01-27',
+            date: '2026-01-27',
             updates: [
                 '【在线客服】优化账号密码显示布局，移至选择框旁边',
                 '【在线客服】刷新账号列表时自动重置账号密码显示',
