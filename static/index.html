@@ -21,80 +21,80 @@
     <div class="sidebar-header">
       <a href="#" class="sidebar-brand">
         <img src="/static/favicon.png" alt="Logo" height="24" class="me-2">
-        闲鱼管理系统
+        <span>闲鱼管理系统</span>
       </a>
     </div>
     <nav class="sidebar-nav">
       <div class="nav-item">
         <a href="#" class="nav-link active" onclick="showSection('dashboard')">
           <i class="bi bi-speedometer2"></i>
-          仪表盘
+          <span>仪表盘</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('accounts')">
           <i class="bi bi-person-circle"></i>
-          账号管理
+          <span>账号管理</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
-          商品管理
+          <span>商品管理</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('orders')">
           <i class="bi bi-receipt-cutoff"></i>
-          订单管理
+          <span>订单管理</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('auto-reply')">
           <i class="bi bi-chat-left-text"></i>
-          自动回复
+          <span>自动回复</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('items-reply')">
           <i class="bi bi-chat-left-text"></i>
-          指定商品回复
+          <span>指定商品回复</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('cards')">
           <i class="bi bi-credit-card"></i>
-          卡券管理
+          <span>卡券管理</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('auto-delivery')">
           <i class="bi bi-truck"></i>
-          自动发货
+          <span>自动发货</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('notification-channels')">
           <i class="bi bi-bell"></i>
-          通知渠道
+          <span>通知渠道</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('message-notifications')">
           <i class="bi bi-chat-dots"></i>
-          消息通知
+          <span>消息通知</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('online-im')">
           <i class="bi bi-headset"></i>
-          在线客服
+          <span>在线客服</span>
         </a>
       </div>
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('system-settings')">
           <i class="bi bi-gear"></i>
-          系统设置
+          <span>系统设置</span>
         </a>
       </div>
 
@@ -106,25 +106,25 @@
         <div class="nav-item">
           <a href="#" class="nav-link" onclick="showSection('user-management')">
             <i class="bi bi-people"></i>
-            用户管理
+            <span>用户管理</span>
           </a>
         </div>
         <div class="nav-item">
           <a href="#" class="nav-link" onclick="showSection('logs')">
             <i class="bi bi-file-text-fill"></i>
-            系统日志
+            <span>系统日志</span>
           </a>
         </div>
         <div class="nav-item">
           <a href="#" class="nav-link" onclick="showSection('risk-control-logs')">
             <i class="bi bi-shield-exclamation"></i>
-            风控日志
+            <span>风控日志</span>
           </a>
         </div>
         <div class="nav-item">
           <a href="#" class="nav-link" onclick="showSection('data-management')">
             <i class="bi bi-database"></i>
-            数据管理
+            <span>数据管理</span>
           </a>
         </div>
       </div>
@@ -132,7 +132,7 @@
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="showSection('about')">
           <i class="bi bi-info-circle"></i>
-          关于
+          <span>关于</span>
         </a>
       </div>
 
@@ -143,10 +143,17 @@
       <div class="nav-item">
         <a href="#" class="nav-link" onclick="logout()">
           <i class="bi bi-box-arrow-right"></i>
-          登出
+          <span>登出</span>
         </a>
       </div>
     </nav>
+    <!-- 侧边栏底部折叠按钮 -->
+    <div class="sidebar-footer">
+      <button class="sidebar-collapse-btn" onclick="toggleSidebarCollapse()" title="折叠/展开侧边栏">
+        <i class="bi bi-chevron-left"></i>
+        <span>收起菜单</span>
+      </button>
+    </div>
   </div>
 
   <!-- 主内容区域 -->

@@ -153,6 +153,29 @@ function toggleSidebar() {
     document.getElementById('sidebar').classList.toggle('show');
 }
 
+// 侧边栏折叠切换
+function toggleSidebarCollapse() {
+    const sidebar = document.getElementById('sidebar');
+    const body = document.body;
+    sidebar.classList.toggle('collapsed');
+    body.classList.toggle('sidebar-collapsed');
+    // 保存状态到 localStorage
+    localStorage.setItem('sidebarCollapsed', sidebar.classList.contains('collapsed'));
+}
+
+// 初始化侧边栏折叠状态
+function initSidebarCollapse() {
+    const isCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
+    if (isCollapsed) {
+        const sidebar = document.getElementById('sidebar');
+        const body = document.body;
+        if (sidebar) {
+            sidebar.classList.add('collapsed');
+            body.classList.add('sidebar-collapsed');
+        }
+    }
+}
+
 // ================================
 // 【仪表盘菜单】相关功能
 // ================================
@@ -2727,6 +2750,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const isAuthenticated = await checkAuth();
     if (!isAuthenticated) return;
 
+    // 初始化侧边栏折叠状态
+    initSidebarCollapse();
     // 加载系统版本号
     loadSystemVersion();
     // 启动验证会话监控
