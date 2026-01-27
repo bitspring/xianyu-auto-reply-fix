@@ -1869,11 +1869,18 @@
     <!-- 系统设置内容 -->
     <div id="system-settings-section" class="content-section">
       <div class="content-header">
-        <h2 class="mb-0">
-          <i class="bi bi-gear me-2"></i>
-          系统设置
-        </h2>
-        <p class="text-muted mb-0">管理系统配置和用户设置</p>
+        <div class="d-flex justify-content-between align-items-center w-100">
+          <div>
+            <h2 class="mb-0">
+              <i class="bi bi-gear me-2"></i>
+              系统设置
+            </h2>
+            <p class="text-muted mb-0">管理系统配置和用户设置</p>
+          </div>
+          <button type="button" id="system-restart-btn" class="btn btn-danger" onclick="restartSystem()" style="display: none;">
+            <i class="bi bi-power me-1"></i>重启系统
+          </button>
+        </div>
       </div>
       <div class="content-body">
         <!-- 第一行：密码设置 + 登录与注册设置 -->
@@ -1978,101 +1985,30 @@
               </div>
               <div class="card-body">
                 <form id="themeForm">
-                  <!-- 主题颜色 -->
+                  <!-- 预设颜色 -->
                   <div class="mb-3">
-                    <label class="form-label fw-bold">主题颜色</label>
+                    <label class="form-label fw-bold">预设颜色</label>
+                    <div class="d-flex flex-wrap gap-2">
+                      <button type="button" class="btn btn-sm color-preset" data-color="#4f46e5" style="background-color: #4f46e5; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="靛蓝色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#7c3aed" style="background-color: #7c3aed; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="紫罗兰"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#2563eb" style="background-color: #2563eb; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="蓝色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#0891b2" style="background-color: #0891b2; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="青色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#059669" style="background-color: #059669; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="绿色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#d97706" style="background-color: #d97706; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="橙色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#dc2626" style="background-color: #dc2626; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="红色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#db2777" style="background-color: #db2777; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="粉色"></button>
+                      <button type="button" class="btn btn-sm color-preset" data-color="#475569" style="background-color: #475569; width: 36px; height: 36px; border-radius: 8px; border: 2px solid transparent;" title="灰色"></button>
+                    </div>
+                  </div>
+
+                  <!-- 自定义颜色 -->
+                  <div class="mb-3">
+                    <label class="form-label fw-bold">自定义颜色</label>
                     <div class="d-flex align-items-center gap-2">
                       <input type="color" class="form-control form-control-color" id="themeColorPicker" value="#4f46e5" title="选择主题颜色">
                       <input type="text" class="form-control" id="themeColorHex" value="#4f46e5" style="width: 120px;" maxlength="7" placeholder="#4f46e5">
                     </div>
-                  </div>
-
-                  <hr>
-
-                  <!-- 背景类型 -->
-                  <div class="mb-3">
-                    <label class="form-label fw-bold">背景类型</label>
-                    <div class="d-flex flex-wrap gap-3">
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgType" id="bgTypeNone" value="none" checked onchange="onBgTypeChange()">
-                        <label class="form-check-label" for="bgTypeNone">无</label>
-                      </div>
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgType" id="bgTypeSolid" value="solid" onchange="onBgTypeChange()">
-                        <label class="form-check-label" for="bgTypeSolid">纯色</label>
-                      </div>
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgType" id="bgTypeGradient" value="gradient" onchange="onBgTypeChange()">
-                        <label class="form-check-label" for="bgTypeGradient">渐变</label>
-                      </div>
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgType" id="bgTypeImage" value="image" onchange="onBgTypeChange()">
-                        <label class="form-check-label" for="bgTypeImage">图片</label>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- 纯色配置 -->
-                  <div id="bgSolidConfig" class="mb-3" style="display: none;">
-                    <label class="form-label">背景颜色</label>
-                    <div class="d-flex align-items-center gap-2">
-                      <input type="color" class="form-control form-control-color" id="bgSolidColor" value="#f0f2f5" title="选择背景颜色">
-                      <input type="text" class="form-control" id="bgSolidColorHex" value="#f0f2f5" style="width: 120px;" maxlength="7">
-                    </div>
-                  </div>
-
-                  <!-- 渐变配置 -->
-                  <div id="bgGradientConfig" class="mb-3" style="display: none;">
-                    <label class="form-label">渐变颜色</label>
-                    <div class="d-flex align-items-center gap-2 mb-2">
-                      <input type="color" class="form-control form-control-color" id="bgGradientStart" value="#667eea" title="起始颜色">
-                      <span class="text-muted">→</span>
-                      <input type="color" class="form-control form-control-color" id="bgGradientEnd" value="#764ba2" title="结束颜色">
-                    </div>
-                    <label class="form-label">渐变方向</label>
-                    <select class="form-select form-select-sm" id="bgGradientDirection">
-                      <option value="to bottom">从上到下</option>
-                      <option value="to right">从左到右</option>
-                      <option value="to bottom right">对角线</option>
-                      <option value="135deg">135度</option>
-                    </select>
-                  </div>
-
-                  <!-- 图片配置 -->
-                  <div id="bgImageConfig" class="mb-3" style="display: none;">
-                    <label class="form-label">图片地址</label>
-                    <input type="text" class="form-control mb-2" id="bgImageUrl" placeholder="输入图片URL地址...">
-                    <div class="row g-2">
-                      <div class="col-6">
-                        <label class="form-label small">模糊度</label>
-                        <div class="d-flex align-items-center gap-2">
-                          <input type="range" class="form-range" id="bgImageBlur" min="0" max="10" value="0" oninput="document.getElementById('bgBlurValue').textContent=this.value+'px'">
-                          <span class="small text-muted" id="bgBlurValue" style="min-width: 35px;">0px</span>
-                        </div>
-                      </div>
-                      <div class="col-6">
-                        <label class="form-label small">遮罩透明度</label>
-                        <div class="d-flex align-items-center gap-2">
-                          <input type="range" class="form-range" id="bgImageOverlay" min="0" max="80" value="30" oninput="document.getElementById('bgOverlayValue').textContent=this.value+'%'">
-                          <span class="small text-muted" id="bgOverlayValue" style="min-width: 35px;">30%</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- 应用范围 -->
-                  <div id="bgScopeConfig" class="mb-3" style="display: none;">
-                    <label class="form-label fw-bold">应用范围</label>
-                    <div class="d-flex gap-3">
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgScope" id="bgScopeContent" value="content" checked>
-                        <label class="form-check-label" for="bgScopeContent">仅主内容区</label>
-                      </div>
-                      <div class="form-check">
-                        <input class="form-check-input" type="radio" name="bgScope" id="bgScopeFull" value="full">
-                        <label class="form-check-label" for="bgScopeFull">整个页面</label>
-                      </div>
-                    </div>
+                    <small class="form-text text-muted">点击色块选择或直接输入颜色代码</small>
                   </div>
 
                   <div class="d-grid mt-3">
@@ -2081,28 +2017,6 @@
                     </button>
                   </div>
                 </form>
-              </div>
-            </div>
-          </div>
-
-          <!-- 系统重启 (仅管理员可见) -->
-          <div class="col-md-6 d-flex">
-            <div id="system-restart-card" class="card flex-fill" style="display: none;">
-              <div class="card-header">
-                <i class="bi bi-power me-2"></i>系统重启
-                <span class="badge bg-danger ms-2">管理员专用</span>
-              </div>
-              <div class="card-body">
-                <p class="text-muted mb-3">重启整个应用系统，所有账号任务将重新启动</p>
-                <button type="button" class="btn btn-danger" onclick="restartSystem()">
-                  <i class="bi bi-power me-1"></i>重启系统
-                </button>
-                <div class="mt-2">
-                  <small class="text-warning">
-                    <i class="bi bi-exclamation-triangle me-1"></i>
-                    注意：重启期间系统将暂时不可用
-                  </small>
-                </div>
               </div>
             </div>
           </div>
@@ -3452,7 +3366,7 @@
 
   <!-- JS依赖 -->
   <script src="/static/lib/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/static/js/app.js?v=2.3.8"></script>
+  <script src="/static/js/app.js?v=2.3.9"></script>
 
   <!-- 默认回复管理模态框 -->
   <div class="modal fade" id="defaultReplyModal" tabindex="-1" aria-labelledby="defaultReplyModalLabel" aria-hidden="true">
