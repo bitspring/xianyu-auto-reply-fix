@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>闲鱼自动回复管理系统</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <!-- 在渲染前立即设置主题，避免闪烁 -->
+  <!-- 在渲染前立即设置主题和关键样式，避免闪烁 -->
   <script>
     (function() {
       var savedMode = localStorage.getItem('darkMode');
@@ -14,6 +14,13 @@
       }
     })();
   </script>
+  <!-- 暗色模式关键内联样式，在外部CSS加载前生效 -->
+  <style>
+    [data-theme="dark"] { background-color: #0f172a; color: #f1f5f9; }
+    [data-theme="dark"] body { background-color: #0f172a; }
+    [data-theme="dark"] .sidebar { background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%); }
+    [data-theme="dark"] .main-content { background: #0f172a; }
+  </style>
   <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
 
