@@ -8,6 +8,11 @@
   - 修复前：会话ID（如 `56226853668@goofish`）被误当作商品ID存入数据库
   - 修复后：只从正确的字段（如 `extension.itemId`、`bizData.itemId`）提取商品ID
   - 递归搜索时跳过会话ID字段和 `@goofish`/`@xianyu` 格式的字符串
+- **订单管理**: 修复递归搜索误提取 tradeId 等非商品ID的问题
+  - 移除对通用 `id` 字段的搜索（避免误提取 tradeId、bizId 等）
+  - 只搜索明确命名为 `itemId` 或 `item_id` 的字段
+  - 跳过 tradeId、bizId、orderId、userId 等已知非商品ID字段
+  - 字符串中只从 `itemId=` URL参数提取，不再从任意数字提取
 
 ### 优化
 - **订单管理**: 下单时自动获取并保存买家昵称

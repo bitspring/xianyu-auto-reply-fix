@@ -3778,19 +3778,22 @@ class XianyuLive:
 
             # 方法2: 遍历整个消息结构查找可能的商品ID
             # 跳过的字段: "1" 是会话ID(chat_id/cid)，不包含商品ID
-            skip_keys = {'1'}
+            # 跳过可能包含非商品ID的字段
+            skip_keys = {'1', 'tradeId', 'trade_id', 'bizId', 'biz_id', 'orderId', 'order_id',
+                        'userId', 'user_id', 'senderId', 'sender_id', 'receiverId', 'receiver_id',
+                        'chatId', 'chat_id', 'conversationId', 'conversation_id', 'msgId', 'msg_id'}
 
             def find_item_id_recursive(obj, path=""):
                 if isinstance(obj, dict):
-                    # 直接查找itemId字段
-                    for key in ['itemId', 'item_id', 'id']:
+                    # 只查找明确命名为 itemId 的字段（不查找通用的 'id' 字段，避免误提取 tradeId 等）
+                    for key in ['itemId', 'item_id']:
                         if key in obj and isinstance(obj[key], (str, int)):
                             value = str(obj[key])
                             if len(value) >= 10 and value.isdigit():
                                 logger.info(f"从{path}.{key}中提取商品ID: {value}")
                                 return value
 
-                    # 递归查找（跳过chat_id相关字段）
+                    # 递归查找（跳过chat_id和其他非商品ID字段）
                     for key, value in obj.items():
                         if key in skip_keys:
                             continue
@@ -3802,11 +3805,12 @@ class XianyuLive:
                     # 跳过chat_id格式的字符串（如 "56226853668@goofish"）
                     if '@goofish' in obj or '@xianyu' in obj:
                         return None
-                    # 从字符串中提取可能的商品ID
-                    id_match = re.search(r'(\d{10,})', obj)
-                    if id_match:
-                        logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
+                    # 只从URL中提取itemId参数，不从普通字符串中提取数字（避免误提取）
+                    if 'itemId=' in obj:
+                        id_match = re.search(r'itemId=(\d{10,})', obj)
+                        if id_match:
+                            logger.info(f"从{path}的URL参数中提取商品ID: {id_match.group(1)}")
+                            return id_match.group(1)
 
                 return None
 
