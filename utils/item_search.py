@@ -407,18 +407,18 @@ class XianyuSearcher:
         
         logger.error(f"❌ 刮刮乐验证失败，已达到最大重试次数 {max_retries}")
         return False
-    
-    async def handle_slider_verification(self, page, context=None, browser=None, playwright=None, max_retries=5):
+
+    async def handle_slider_verification(self, page, context=None, browser=None, playwright=None, max_retries=3):
         """
         通用的滑块验证处理方法
-        
+
         参数:
             page: Playwright 页面对象（必需）
             context: Playwright 上下文对象（可选，如果不传则使用 self.context）
             browser: Playwright 浏览器对象（可选，如果不传则使用 self.browser）
             playwright: Playwright 实例（可选，如果不传则使用 self.playwright）
-            max_retries: 最大重试次数，默认5次
-            
+            max_retries: 最大重试次数，默认3次（🔧 2026-01-28: 从5改为3）
+
         返回:
             bool: True表示成功（包括没有滑块或滑块验证成功），False表示失败
         """
@@ -883,7 +883,7 @@ class XianyuSearcher:
                     context=self.context,
                     browser=self.browser,
                     playwright=getattr(self, 'playwright', None),
-                    max_retries=5
+                    max_retries=3
                 )
                 
                 if not slider_result:
@@ -1340,7 +1340,7 @@ class XianyuSearcher:
                     context=self.context,
                     browser=self.browser,
                     playwright=getattr(self, 'playwright', None),
-                    max_retries=5
+                    max_retries=3
                 )
                 
                 if not slider_result:
