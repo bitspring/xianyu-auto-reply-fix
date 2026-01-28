@@ -5129,7 +5129,7 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
-    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False):
+    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None):
         """获取订单详情信息（使用独立的锁机制，不受延迟锁影响）
 
         Args:
@@ -5139,6 +5139,7 @@ class XianyuLive:
             debug_headless: 是否使用有头模式调试
             sid: 会话ID（如 56226853668@goofish），用于简化消息匹配订单
             force_refresh: 是否强制刷新（跳过缓存直接从闲鱼获取）
+            buyer_nick: 买家昵称（从下单消息中提取）
         """
         # 使用独立的订单详情锁，不与自动发货锁冲突
         order_detail_lock = self._order_detail_locks[order_id]
@@ -5209,11 +5210,12 @@ class XianyuLive:
                         if not cookie_info:
                             logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
                         else:
-                            # 先保存订单基本信息（包含sid用于简化消息匹配）
+                            # 先保存订单基本信息（包含sid和buyer_nick用于简化消息匹配）
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
                                 buyer_id=buyer_id,
+                                buyer_nick=buyer_nick,  # 传递买家昵称
                                 sid=sid,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
@@ -8429,20 +8431,26 @@ class XianyuLive:
 
                     # 立即获取订单详情信息
                     try:
-                        # 先尝试提取用户ID和商品ID用于订单详情获取
+                        # 先尝试提取用户ID、商品ID和买家昵称用于订单详情获取
                         temp_user_id = None
                         temp_item_id = None
                         temp_sid = None
+                        temp_buyer_nick = None  # 买家昵称
 
-                        # 提取用户ID
+                        # 提取用户ID和买家昵称
                         try:
                             message_1 = message.get("1")
                             if isinstance(message_1, str) and '@' in message_1:
                                 temp_user_id = message_1.split('@')[0]
                             elif isinstance(message_1, dict):
-                                # 从字典中提取用户ID
+                                # 从字典中提取用户ID和买家昵称
                                 if "10" in message_1 and isinstance(message_1["10"], dict):
-                                    temp_user_id = message_1["10"].get("senderUserId", "unknown_user")
+                                    message_10 = message_1["10"]
+                                    temp_user_id = message_10.get("senderUserId", "unknown_user")
+                                    # 提取买家昵称（优先senderNick，其次reminderTitle）
+                                    temp_buyer_nick = message_10.get("senderNick") or message_10.get("reminderTitle")
+                                    if temp_buyer_nick:
+                                        logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 提取到买家昵称: {temp_buyer_nick}")
                                 else:
                                     temp_user_id = "unknown_user"
                         except Exception:
@@ -8472,8 +8480,8 @@ class XianyuLive:
                         except Exception:
                             pass
 
-                        # 调用订单详情获取方法（传入sid用于保存到数据库）
-                        order_detail = await self.fetch_order_detail_info(order_id, temp_item_id, temp_user_id, sid=temp_sid)
+                        # 调用订单详情获取方法（传入sid和buyer_nick用于保存到数据库）
+                        order_detail = await self.fetch_order_detail_info(order_id, temp_item_id, temp_user_id, sid=temp_sid, buyer_nick=temp_buyer_nick)
                         if order_detail:
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 订单详情获取成功: {order_id}')
                         else:
