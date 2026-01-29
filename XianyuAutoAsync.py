@@ -8451,8 +8451,8 @@ class XianyuLive:
                                 if "10" in message_1 and isinstance(message_1["10"], dict):
                                     message_10 = message_1["10"]
                                     temp_user_id = message_10.get("senderUserId", "unknown_user")
-                                    # 提取买家昵称（优先senderNick，其次reminderTitle）
-                                    temp_buyer_nick = message_10.get("senderNick") or message_10.get("reminderTitle")
+                                    # 提取买家昵称（只使用senderNick，不用reminderTitle，后者是提醒标题如"买家已拍下，待付款"）
+                                    temp_buyer_nick = message_10.get("senderNick")
                                     if temp_buyer_nick:
                                         logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 提取到买家昵称: {temp_buyer_nick}")
                                 else:
