@@ -5384,7 +5384,8 @@ class DBManager:
     def update_buyer_nick_by_buyer_id(self, buyer_id: str, buyer_nick: str, cookie_id: str = None):
         """根据买家ID更新所有相关订单的买家昵称
 
-        当收到买家消息时调用此方法，自动补全该买家所有订单的昵称
+        当收到买家消息时调用此方法，自动更新该买家所有订单的昵称
+        允许覆盖已有昵称，以便使用更准确的昵称替换可能不准确的值
 
         Args:
             buyer_id: 买家用户ID
@@ -5401,16 +5402,16 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 只更新 buyer_nick 为空的订单
+                # 更新该买家所有订单的昵称（允许覆盖已有值）
                 if cookie_id:
                     cursor.execute('''
                     UPDATE orders SET buyer_nick = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE buyer_id = ? AND cookie_id = ? AND (buyer_nick IS NULL OR buyer_nick = '')
+                    WHERE buyer_id = ? AND cookie_id = ?
                     ''', (buyer_nick, buyer_id, cookie_id))
                 else:
                     cursor.execute('''
                     UPDATE orders SET buyer_nick = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE buyer_id = ? AND (buyer_nick IS NULL OR buyer_nick = '')
+                    WHERE buyer_id = ?
                     ''', (buyer_nick, buyer_id))
 
                 updated_count = cursor.rowcount

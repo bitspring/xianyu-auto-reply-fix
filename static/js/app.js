@@ -181,40 +181,86 @@ function initSidebarCollapse() {
 // 暗色模式功能
 // ================================
 
-// 切换暗色模式
-function toggleDarkMode() {
-    const html = document.documentElement;
-    const icon = document.getElementById('darkModeIcon');
-    const isDark = html.getAttribute('data-theme') === 'dark';
+// 检测系统是否为暗色模式
+function isSystemDarkMode() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+}
 
-    if (isDark) {
-        html.removeAttribute('data-theme');
-        localStorage.setItem('darkMode', 'light');
-        if (icon) {
-            icon.classList.remove('bi-sun-fill');
-            icon.classList.add('bi-moon-fill');
-        }
+// 更新主题图标
+function updateDarkModeIcon(mode) {
+    const icon = document.getElementById('darkModeIcon');
+    if (!icon) return;
+
+    // 清除所有可能的图标类
+    icon.classList.remove('bi-moon-fill', 'bi-sun-fill', 'bi-circle-half');
+
+    if (mode === 'auto') {
+        icon.classList.add('bi-circle-half');
+    } else if (mode === 'dark') {
+        icon.classList.add('bi-sun-fill');
     } else {
-        html.setAttribute('data-theme', 'dark');
-        localStorage.setItem('darkMode', 'dark');
-        if (icon) {
-            icon.classList.remove('bi-moon-fill');
-            icon.classList.add('bi-sun-fill');
-        }
+        icon.classList.add('bi-moon-fill');
     }
+}
+
+// 应用主题
+function applyDarkMode(mode) {
+    const html = document.documentElement;
+    let shouldBeDark = false;
+
+    if (mode === 'auto') {
+        shouldBeDark = isSystemDarkMode();
+    } else if (mode === 'dark') {
+        shouldBeDark = true;
+    }
+
+    if (shouldBeDark) {
+        html.setAttribute('data-theme', 'dark');
+    } else {
+        html.removeAttribute('data-theme');
+    }
+
+    updateDarkModeIcon(mode);
+}
+
+// 切换暗色模式（三态切换：light → dark → auto）
+function toggleDarkMode() {
+    const currentMode = localStorage.getItem('darkMode') || 'light';
+    let nextMode;
+
+    if (currentMode === 'light') {
+        nextMode = 'dark';
+    } else if (currentMode === 'dark') {
+        nextMode = 'auto';
+    } else {
+        nextMode = 'light';
+    }
+
+    localStorage.setItem('darkMode', nextMode);
+    applyDarkMode(nextMode);
+
+    // 显示提示
+    const modeNames = {
+        'light': '浅色模式',
+        'dark': '深色模式',
+        'auto': '跟随系统'
+    };
+    showToast(`已切换至${modeNames[nextMode]}`, 'info');
 }
 
 // 初始化暗色模式
 function initDarkMode() {
-    const savedMode = localStorage.getItem('darkMode');
-    const icon = document.getElementById('darkModeIcon');
+    const savedMode = localStorage.getItem('darkMode') || 'light';
+    applyDarkMode(savedMode);
 
-    if (savedMode === 'dark') {
-        document.documentElement.setAttribute('data-theme', 'dark');
-        if (icon) {
-            icon.classList.remove('bi-moon-fill');
-            icon.classList.add('bi-sun-fill');
-        }
+    // 监听系统主题变化
+    if (window.matchMedia) {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            const currentMode = localStorage.getItem('darkMode') || 'light';
+            if (currentMode === 'auto') {
+                applyDarkMode('auto');
+            }
+        });
     }
 }
 

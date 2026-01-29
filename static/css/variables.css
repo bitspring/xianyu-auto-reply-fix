@@ -178,3 +178,245 @@
     border-color: var(--input-border);
     color: var(--text-color);
   }
+
+  /* 暗色模式下的表单标签 */
+  [data-theme="dark"] .form-label,
+  [data-theme="dark"] .form-check-label,
+  [data-theme="dark"] .col-form-label {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的卡片标题和文字 */
+  [data-theme="dark"] .card-title,
+  [data-theme="dark"] .card-text,
+  [data-theme="dark"] .card-header,
+  [data-theme="dark"] .card-body {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的纯文本表单控件 */
+  [data-theme="dark"] .form-control-plaintext {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的表格表头 */
+  [data-theme="dark"] .table th {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的 Bootstrap 文字颜色类 */
+  [data-theme="dark"] .text-dark {
+    color: var(--text-color) !important;
+  }
+
+  [data-theme="dark"] .text-body {
+    color: var(--text-color) !important;
+  }
+
+  /* 暗色模式下的 alert 组件 */
+  [data-theme="dark"] .alert {
+    color: var(--text-color);
+    border-color: var(--border-color);
+  }
+
+  [data-theme="dark"] .alert-info {
+    background-color: rgba(59, 130, 246, 0.2);
+    border-color: rgba(59, 130, 246, 0.3);
+    color: #93c5fd;
+  }
+
+  [data-theme="dark"] .alert-warning {
+    background-color: rgba(245, 158, 11, 0.2);
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #fcd34d;
+  }
+
+  [data-theme="dark"] .alert-danger {
+    background-color: rgba(239, 68, 68, 0.2);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+  }
+
+  [data-theme="dark"] .alert-success {
+    background-color: rgba(16, 185, 129, 0.2);
+    border-color: rgba(16, 185, 129, 0.3);
+    color: #6ee7b7;
+  }
+
+  /* 暗色模式下的状态徽章 */
+  [data-theme="dark"] .status-badge.enabled {
+    background-color: rgba(16, 185, 129, 0.2);
+    color: #6ee7b7;
+  }
+
+  [data-theme="dark"] .status-badge.disabled {
+    background-color: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+  }
+
+  /* 暗色模式下的空状态图标 */
+  [data-theme="dark"] .empty-state i,
+  [data-theme="dark"] .text-center i[style*="color: #ccc"] {
+    color: var(--text-secondary) !important;
+  }
+
+  /* 暗色模式下的标题和段落 */
+  [data-theme="dark"] h1, [data-theme="dark"] h2, [data-theme="dark"] h3,
+  [data-theme="dark"] h4, [data-theme="dark"] h5, [data-theme="dark"] h6 {
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] p {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的小字和次要文字 */
+  [data-theme="dark"] small,
+  [data-theme="dark"] .small,
+  [data-theme="dark"] .text-secondary {
+    color: var(--text-secondary) !important;
+  }
+
+  /* 暗色模式下的账号禁用状态 */
+  [data-theme="dark"] .account-row.disabled {
+    background-color: rgba(0, 0, 0, 0.2);
+  }
+
+  /* 暗色模式下的 Cookie 值显示 */
+  [data-theme="dark"] .cookie-value {
+    background-color: var(--input-bg);
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的选择器标题 */
+  [data-theme="dark"] .selector-title,
+  [data-theme="dark"] .selector-subtitle {
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的关键词管理 */
+  [data-theme="dark"] .keyword-container,
+  [data-theme="dark"] .keyword-input-area {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+  }
+
+  [data-theme="dark"] .keyword-group-title,
+  [data-theme="dark"] .section-title,
+  [data-theme="dark"] .reply-text,
+  [data-theme="dark"] .reply-text-content {
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .empty-state,
+  [data-theme="dark"] .empty-state h3 {
+    color: var(--text-secondary);
+  }
+
+  [data-theme="dark"] .edit-btn {
+    background-color: var(--input-bg);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .input-field label {
+    color: var(--text-secondary);
+  }
+
+  /* 暗色模式下的 nav-tabs */
+  [data-theme="dark"] .nav-tabs {
+    border-color: var(--border-color);
+  }
+
+  [data-theme="dark"] .nav-tabs .nav-link {
+    color: var(--text-secondary);
+  }
+
+  [data-theme="dark"] .nav-tabs .nav-link.active {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .nav-tabs .nav-link:hover {
+    border-color: var(--border-color);
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的 accordion */
+  [data-theme="dark"] .accordion-item {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+  }
+
+  [data-theme="dark"] .accordion-button {
+    background-color: var(--card-bg);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .accordion-button:not(.collapsed) {
+    background-color: var(--input-bg);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .accordion-body {
+    background-color: var(--card-bg);
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的账号选择器 */
+  [data-theme="dark"] .account-selector {
+    background-color: var(--card-bg);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+
+  [data-theme="dark"] .account-select {
+    background-color: var(--input-bg);
+    border-color: var(--input-border);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .account-select:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+  }
+
+  [data-theme="dark"] .selector-title {
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .selector-subtitle {
+    color: var(--text-secondary);
+  }
+
+  [data-theme="dark"] .account-select-wrapper select option {
+    background-color: var(--card-bg);
+    color: var(--text-color);
+  }
+
+  /* 暗色模式下的表单帮助文字 */
+  [data-theme="dark"] .form-text {
+    color: var(--text-secondary);
+  }
+
+  /* 暗色模式下的菜单管理列表 */
+  [data-theme="dark"] .menu-sort-item {
+    background-color: var(--input-bg);
+    border-color: var(--border-color);
+    color: var(--text-color);
+  }
+
+  [data-theme="dark"] .menu-sort-item:hover {
+    background-color: var(--card-bg);
+  }
+
+  [data-theme="dark"] .menu-sort-item.dragging {
+    background-color: var(--bg-secondary);
+  }
+
+  [data-theme="dark"] .menu-sort-item .drag-handle {
+    color: var(--text-secondary);
+  }
+
+  [data-theme="dark"] .menu-sort-item .menu-name {
+    color: var(--text-color);
+  }

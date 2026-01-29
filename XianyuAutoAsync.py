@@ -8451,8 +8451,18 @@ class XianyuLive:
                                 if "10" in message_1 and isinstance(message_1["10"], dict):
                                     message_10 = message_1["10"]
                                     temp_user_id = message_10.get("senderUserId", "unknown_user")
-                                    # 提取买家昵称（只使用senderNick，不用reminderTitle，后者是提醒标题如"买家已拍下，待付款"）
+                                    # 提取买家昵称：优先使用senderNick，如果为空则尝试使用reminderTitle（需过滤系统提示）
                                     temp_buyer_nick = message_10.get("senderNick")
+                                    if not temp_buyer_nick:
+                                        # senderNick为空，尝试使用reminderTitle作为备选
+                                        reminder_title = message_10.get("reminderTitle", "")
+                                        if reminder_title:
+                                            # 系统提示文本关键词列表（这些不是买家昵称）
+                                            system_keywords = ['待付款', '待发货', '已付款', '发货', '收货', '退款', '交易', '拍下', '付款', '确认', '成功', '关闭']
+                                            is_system_text = any(keyword in reminder_title for keyword in system_keywords)
+                                            if not is_system_text:
+                                                temp_buyer_nick = reminder_title
+                                                logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 从reminderTitle提取到买家昵称: {temp_buyer_nick}")
                                     if temp_buyer_nick:
                                         logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 提取到买家昵称: {temp_buyer_nick}")
                                 else:
@@ -8999,12 +9009,17 @@ class XianyuLive:
                     # 如果处理异常，继续正常处理流程（会受到暂停影响）
 
             # 自动更新买家昵称（补全历史订单的昵称信息）
+            # 需要过滤掉系统提示文本，避免将"买家已拍下，待付款"等写入昵称
             if send_user_id and send_user_name:
-                try:
-                    from db_manager import db_manager
-                    db_manager.update_buyer_nick_by_buyer_id(send_user_id, send_user_name, self.cookie_id)
-                except Exception as e:
-                    logger.debug(f"更新买家昵称失败: {self._safe_str(e)}")
+                # 检查是否为系统提示文本
+                system_keywords = ['待付款', '待发货', '已付款', '发货', '收货', '退款', '交易', '拍下', '付款', '确认', '成功', '关闭']
+                is_system_text = any(keyword in send_user_name for keyword in system_keywords)
+                if not is_system_text:
+                    try:
+                        from db_manager import db_manager
+                        db_manager.update_buyer_nick_by_buyer_id(send_user_id, send_user_name, self.cookie_id)
+                    except Exception as e:
+                        logger.debug(f"更新买家昵称失败: {self._safe_str(e)}")
 
             # 使用防抖机制处理聊天消息回复
             # 如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
