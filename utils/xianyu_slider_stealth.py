@@ -15,6 +15,8 @@ import tempfile
 import shutil
 from datetime import datetime
 from playwright.sync_api import sync_playwright, ElementHandle
+from playwright.async_api import async_playwright
+import asyncio
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from loguru import logger
 from collections import defaultdict
@@ -4332,6 +4334,13 @@ class XianyuSliderStealth:
                 '--disable-web-security',
                 '--disable-features=VizDisplayCompositor',
                 '--lang=zh-CN',  # 设置浏览器语言为中文
+                # 反检测增强参数
+                '--disable-infobars',
+                '--disable-extensions',
+                '--disable-popup-blocking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
             ]
             
             # 在启动Playwright之前，重新检查和设置浏览器路径
@@ -4368,7 +4377,7 @@ class XianyuSliderStealth:
                 headless=not show_browser,
                 args=browser_args,
                 viewport={'width': 1980, 'height': 1024},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 locale='zh-CN',  # 设置浏览器区域为中文
                 accept_downloads=True,
                 ignore_https_errors=True,
@@ -4380,13 +4389,37 @@ class XianyuSliderStealth:
             
             browser = context.browser
             page = context.new_page()
+
+            # 注入反检测脚本
+            stealth_js = """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            window.chrome = { runtime: {} };
+            """
+            page.add_init_script(stealth_js)
+
             logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式）")
             
             try:
-                # 访问登录页面
+                # 访问登录页面（带重试逻辑）
                 login_url = "https://www.goofish.com/im"
                 logger.info(f"【{self.pure_user_id}】访问登录页面: {login_url}")
-                page.goto(login_url, wait_until='networkidle', timeout=60000)
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        page.goto(login_url, wait_until='networkidle', timeout=60000)
+                        break
+                    except Exception as e:
+                        error_msg = str(e)
+                        if any(err in error_msg for err in ['ERR_CONNECTION_CLOSED', 'ERR_CONNECTION_RESET', 'ERR_CONNECTION_REFUSED']):
+                            if attempt < max_retries - 1:
+                                wait_time = 2 * (attempt + 1)
+                                logger.warning(f"【{self.pure_user_id}】连接被关闭，{wait_time}秒后第{attempt+2}次重试...")
+                                time.sleep(wait_time)
+                                continue
+                        raise
                 
                 # 等待页面加载
                 wait_time = 2 if not show_browser else 2
@@ -5653,6 +5686,36 @@ class XianyuSliderStealth:
         finally:
             # 关闭浏览器
             self.close_browser()
+
+    async def async_run(self, url: str):
+        """异步运行主流程，返回(成功状态, cookie数据)
+
+        在独立线程中运行同步的 Playwright，避免事件循环冲突
+        """
+        import asyncio
+
+        def _run_in_thread():
+            """在独立线程中运行同步代码"""
+            import asyncio
+            # 确保线程中没有运行的事件循环
+            try:
+                loop = asyncio.get_running_loop()
+                # 如果有运行中的循环，创建新循环
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            except RuntimeError:
+                # 没有运行中的循环，正常
+                pass
+
+            # 调用同步的 run 方法
+            return self.run(url)
+
+        # 使用 asyncio.to_thread 在独立线程中运行
+        return await asyncio.to_thread(_run_in_thread)
+
+    async def _async_close_browser(self):
+        """异步版本的清理方法（兼容性保留，实际清理由同步 run 方法完成）"""
+        # 由于 async_run 现在调用同步的 run 方法，清理工作已经在 run 的 finally 中完成
+        pass
 
 def get_slider_stats():
     """获取滑块验证并发统计信息"""

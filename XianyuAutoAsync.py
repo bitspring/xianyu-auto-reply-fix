@@ -2434,18 +2434,8 @@ class XianyuLive:
                     headless=True  # 使用有头模式（可视化浏览器）
                 )
 
-                # 在线程池中执行滑块验证
-                import asyncio
-                import concurrent.futures
-
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证
-                    success, cookies = await loop.run_in_executor(
-                        executor,
-                        slider_stealth.run,
-                        verification_url
-                    )
+                # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
+                success, cookies = await slider_stealth.async_run(verification_url)
 
                 if success and cookies:
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
