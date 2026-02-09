@@ -3526,7 +3526,8 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             'face_verify': {
                 'account_id': '测试账号',
                 'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
-                'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test'
+                'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test',
+                'verification_type': '人脸验证'
             },
             'password_login_success': {
                 'account_id': '测试账号',

@@ -4207,15 +4207,14 @@ class XianyuLive:
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 账号密码登录需要人脸验证
-
-账号: {account_id}
-时间: {time}
+            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+在验证期间，发货及自动回复暂时无法使用。
 
 请点击验证链接完成验证:
 {verification_url}
 
-在验证期间，闲鱼自动回复暂时无法使用。''',
+账号: {account_id}
+时间: {time}''',
             'password_login_success': '''✅ 密码登录成功
 
 账号: {account_id}
@@ -4952,14 +4951,25 @@ Cookie数量: {cookie_count}
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     cookie_count='已获取'
                 )
-            elif "人脸验证" in error_message or (verification_url and "passport" in verification_url):
-                # 人脸验证使用专用模板
+            elif "人脸验证" in error_message or "短信验证" in error_message or "二维码验证" in error_message or "身份验证" in error_message or (verification_url and "passport" in verification_url):
+                # 验证类型（人脸/短信/二维码/身份验证）使用专用模板
+                # 根据消息内容判断验证类型
+                if "人脸验证" in error_message:
+                    verify_type = "人脸验证"
+                elif "短信验证" in error_message:
+                    verify_type = "短信验证"
+                elif "二维码验证" in error_message:
+                    verify_type = "二维码验证"
+                else:
+                    verify_type = "身份验证"
+
                 template = self._get_notification_template('face_verify')
                 notification_msg = self._format_template(
                     template,
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                    verification_url=verification_url or '无'
+                    verification_url=verification_url or '无',
+                    verification_type=verify_type
                 )
             elif verification_url:
                 # 如果有验证链接，使用模板并添加验证链接

@@ -505,15 +505,14 @@ class DBManager:
 
 账号: {account_id}
 时间: {time}'),
-            ('face_verify', '⚠️ 账号密码登录需要人脸验证
-
-账号: {account_id}
-时间: {time}
+            ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+在验证期间，发货及自动回复暂时无法使用。
 
 请点击验证链接完成验证:
 {verification_url}
 
-在验证期间，闲鱼自动回复暂时无法使用。'),
+账号: {account_id}
+时间: {time}'),
             ('password_login_success', '✅ 密码登录成功
 
 账号: {account_id}
@@ -713,15 +712,14 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}'),
-                ('face_verify', '⚠️ 账号密码登录需要人脸验证
-
-账号: {account_id}
-时间: {time}
+                ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+在验证期间，发货及自动回复暂时无法使用。
 
 请点击验证链接完成验证:
 {verification_url}
 
-在验证期间，闲鱼自动回复暂时无法使用。'),
+账号: {account_id}
+时间: {time}'),
                 ('password_login_success', '✅ 密码登录成功
 
 账号: {account_id}
@@ -2946,15 +2944,14 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 账号密码登录需要人脸验证
-
-账号: {account_id}
-时间: {time}
+            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+在验证期间，发货及自动回复暂时无法使用。
 
 请点击验证链接完成验证:
 {verification_url}
 
-在验证期间，闲鱼自动回复暂时无法使用。''',
+账号: {account_id}
+时间: {time}''',
             'password_login_success': '''✅ 密码登录成功
 
 账号: {account_id}
@@ -3010,15 +3007,14 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 账号密码登录需要人脸验证
-
-账号: {account_id}
-时间: {time}
+            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+在验证期间，发货及自动回复暂时无法使用。
 
 请点击验证链接完成验证:
 {verification_url}
 
-在验证期间，闲鱼自动回复暂时无法使用。''',
+账号: {account_id}
+时间: {time}''',
             'password_login_success': '''✅ 密码登录成功
 
 账号: {account_id}
