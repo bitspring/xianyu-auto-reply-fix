@@ -4042,6 +4042,36 @@ class XianyuSliderStealth:
                                 verification_type = self._detect_verification_type(frame)
                                 logger.info(f"【{self.pure_user_id}】检测到验证类型: {verification_type}")
 
+                                # 记录风控日志
+                                try:
+                                    from db_manager import db_manager
+                                    event_type_map = {
+                                        'password_error': 'password_error',
+                                        'sms_verify': 'sms_verify',
+                                        'qr_verify': 'qr_verify',
+                                        'face_verify': 'face_verify',
+                                        'unknown': 'face_verify'
+                                    }
+                                    event_type_names = {
+                                        'password_error': '账号密码错误',
+                                        'sms_verify': '短信验证',
+                                        'qr_verify': '二维码验证',
+                                        'face_verify': '人脸验证',
+                                        'unknown': '身份验证'
+                                    }
+                                    db_event_type = event_type_map.get(verification_type, 'face_verify')
+                                    event_name = event_type_names.get(verification_type, '身份验证')
+                                    db_manager.add_risk_control_log(
+                                        cookie_id=self.pure_user_id,
+                                        event_type=db_event_type,
+                                        event_description=f"检测到{event_name}",
+                                        processing_status='processing' if verification_type != 'password_error' else 'failed',
+                                        error_message=f"触发场景: 密码登录, URL: {frame_url}"
+                                    )
+                                    logger.info(f"【{self.pure_user_id}】已记录风控日志: {db_event_type}")
+                                except Exception as log_err:
+                                    logger.warning(f"【{self.pure_user_id}】记录风控日志失败: {log_err}")
+
                                 # 如果是账密错误，抛出异常让调用者处理
                                 if verification_type == 'password_error':
                                     logger.error(f"【{self.pure_user_id}】❌ 检测到账号密码错误")

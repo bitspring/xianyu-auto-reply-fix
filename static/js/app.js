@@ -12770,10 +12770,20 @@ function displayRiskControlLogs(logs) {
                 statusBadge = '<span class="badge bg-secondary">未知</span>';
         }
 
+        // 事件类型映射
+        const eventTypeMap = {
+            'slider_captcha': '滑块验证',
+            'face_verify': '人脸验证',
+            'sms_verify': '短信验证',
+            'qr_verify': '二维码验证',
+            'password_error': '账密错误'
+        };
+        const eventTypeName = eventTypeMap[log.event_type] || log.event_type || '-';
+
         row.innerHTML = `
             <td class="text-nowrap">${createdAt}</td>
             <td class="text-nowrap">${escapeHtml(log.cookie_id || '-')}</td>
-            <td class="text-nowrap">${escapeHtml(log.event_type || '-')}</td>
+            <td class="text-nowrap">${escapeHtml(eventTypeName)}</td>
             <td>${statusBadge}</td>
             <td class="text-truncate" style="max-width: 200px;" title="${escapeHtml(log.event_description || '-')}">${escapeHtml(log.event_description || '-')}</td>
             <td class="text-truncate" style="max-width: 200px;" title="${escapeHtml(log.processing_result || '-')}">${escapeHtml(log.processing_result || '-')}</td>
