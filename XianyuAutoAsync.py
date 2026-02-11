@@ -2287,6 +2287,19 @@ class XianyuLive:
                     if isinstance(res_json, dict):
                         res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
                         if '令牌过期' in res_json_str or 'Session过期' in res_json_str:
+                            # 记录令牌/Session过期到风控日志
+                            try:
+                                from db_manager import db_manager
+                                expire_type = '令牌过期' if '令牌过期' in res_json_str else 'Session过期'
+                                db_manager.add_risk_control_log(
+                                    cookie_id=self.cookie_id,
+                                    event_type='token_expired',
+                                    event_description=f"检测到{expire_type}，准备刷新Cookie并重启实例",
+                                    processing_status='processing'
+                                )
+                            except Exception as log_e:
+                                logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
+
                             # 调用统一的密码登录刷新方法
                             refresh_success = await self._try_password_login_refresh("令牌/Session过期")
                             
@@ -2551,6 +2564,19 @@ class XianyuLive:
                 log_captcha_event(self.cookie_id, "XianyuSliderStealth导入失败", False,
                     f"Playwright未安装, 错误: {import_e}")
 
+                # 记录到风控日志
+                try:
+                    from db_manager import db_manager
+                    db_manager.add_risk_control_log(
+                        cookie_id=self.cookie_id,
+                        event_type='slider_captcha',
+                        event_description="XianyuSliderStealth导入失败，Playwright未安装",
+                        processing_status='failed',
+                        error_message=str(import_e)
+                    )
+                except Exception as log_e:
+                    logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
+
                 # 发送通知
                 await self.send_token_refresh_notification(
                     f"滑块验证功能不可用，请安装Playwright。验证URL: {verification_url}",
@@ -2564,6 +2590,19 @@ class XianyuLive:
                 # 记录异常到日志文件
                 log_captcha_event(self.cookie_id, "滑块验证异常", False,
                     f"执行异常, 错误: {self._safe_str(stealth_e)[:100]}")
+
+                # 记录到风控日志
+                try:
+                    from db_manager import db_manager
+                    db_manager.add_risk_control_log(
+                        cookie_id=self.cookie_id,
+                        event_type='slider_captcha',
+                        event_description="滑块验证执行异常",
+                        processing_status='failed',
+                        error_message=self._safe_str(stealth_e)[:200]
+                    )
+                except Exception as log_e:
+                    logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
 
                 # 发送通知（检查WebSocket连接状态）
                 # 只有在WebSocket未连接时才发送通知，已连接说明可能是暂时性问题
@@ -2776,6 +2815,18 @@ class XianyuLive:
         # 记录到日志文件
         log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
             f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
+
+        # 记录到风控日志
+        try:
+            from db_manager import db_manager
+            db_manager.add_risk_control_log(
+                cookie_id=self.cookie_id,
+                event_type='cookie_refresh',
+                event_description=f"{trigger_reason}触发Cookie刷新和实例重启",
+                processing_status='processing'
+            )
+        except Exception as log_e:
+            logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
 
         try:
             # 从数据库获取账号登录信息

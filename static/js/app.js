@@ -12776,7 +12776,9 @@ function displayRiskControlLogs(logs) {
             'face_verify': '人脸验证',
             'sms_verify': '短信验证',
             'qr_verify': '二维码验证',
-            'password_error': '账密错误'
+            'password_error': '账密错误',
+            'token_expired': '令牌过期',
+            'cookie_refresh': 'Cookie刷新'
         };
         const eventTypeName = eventTypeMap[log.event_type] || log.event_type || '-';
 
@@ -13437,7 +13439,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.2.4';
+const DEFAULT_VERSION = 'v1.2.5';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -13450,9 +13452,17 @@ let remoteVersionInfo = null;
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.2.4',
+    version: 'v1.2.5',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.2.5',
+            date: '2026-02-12',
+            updates: [
+                '【新功能】风控日志新增令牌过期、Cookie刷新等事件类型，支持7种状态显示',
+                '【优化】滑块验证异常和导入失败事件同步写入风控日志数据库'
+            ]
+        },
         {
             version: 'v1.2.4',
             date: '2026-02-08',
@@ -13932,151 +13942,32 @@ function showChangelogModal() {
     const changelogContent = document.getElementById('changelogContent');
     if (!changelogContent) return;
 
-    // 更新日志数据
-    const changelog = [
-        {
-            version: 'v1.2.4',
-            date: '2026-02-08',
-            changes: [
-                { type: 'feature', text: '优化验证类型检测，精确区分人脸/短信/二维码/账密错误' },
-                { type: 'feature', text: '新增 {verification_type} 模板变量' },
-                { type: 'feature', text: '风控日志支持多种事件类型' },
-                { type: 'fix', text: '修复密码登录时 db_manager 变量作用域问题' },
-                { type: 'fix', text: '移除通知中的【闲鱼通知】前缀' }
-            ]
-        },
-        {
-            version: 'v1.2.3',
-            date: '2026-02-08',
-            changes: [
-                { type: 'feature', text: '新增通知模板自定义功能，支持7种通知类型' },
-                { type: 'feature', text: '暗色模式新增跟随系统选项' },
-                { type: 'fix', text: '修复飞书通知签名验证失败的问题' },
-                { type: 'fix', text: '修复通知内容重复显示账号ID和时间的问题' }
-            ]
-        },
-        {
-            version: 'v1.2.2',
-            date: '2026-01-29',
-            changes: [
-                { type: 'fix', text: '修复下单时买家昵称提取错误的问题' },
-                { type: 'fix', text: '修复点击导航链接会刷新页面的问题' },
-                { type: 'fix', text: '修复暗色模式刷新页面闪烁问题' },
-                { type: 'fix', text: '修复递归搜索误提取tradeId等非商品ID的问题' },
-                { type: 'fix', text: '修复订单管理商品ID提取错误的问题' }
-            ]
-        },
-        {
-            version: 'v1.2.1',
-            date: '2026-01-28',
-            changes: [
-                { type: 'feature', text: '新增暗色模式支持，可在系统设置中切换主题' },
-                { type: 'feature', text: '下单时自动获取并保存买家昵称' }
-            ]
-        },
-        {
-            version: 'v1.2.0',
-            date: '2026-01-28',
-            changes: [
-                { type: 'optimize', text: '大幅优化滑块验证重试策略' },
-                { type: 'optimize', text: '缩短滑块验证重试等待时间' }
-            ]
-        },
-        {
-            version: 'v1.1.9',
-            date: '2026-01-28',
-            changes: [
-                { type: 'fix', text: '修复交易关闭时订单状态不更新的问题' }
-            ]
-        },
-        {
-            version: 'v1.1.8',
-            date: '2026-01-28',
-            changes: [
-                { type: 'optimize', text: '优化滑块验证策略' },
-                { type: 'feature', text: '添加滑块验证优化代码' }
-            ]
-        },
-        {
-            version: 'v1.1.7',
-            date: '2026-01-28',
-            changes: [
-                { type: 'feature', text: '菜单管理: 新增拖拽排序功能' },
-                { type: 'feature', text: '按住拖动图标可调整菜单顺序' },
-                { type: 'feature', text: '菜单顺序自动保存到用户配置' },
-                { type: 'feature', text: '版本信息: 点击版本号可查看更新日志' },
-                { type: 'optimize', text: '侧边栏: 使用CSS order属性实现菜单重排序' },
-                { type: 'fix', text: '修复菜单排序后管理员功能和登出按钮位置错乱的问题' }
-            ]
-        },
-        {
-            version: 'v1.1.6',
-            date: '2026-01-27',
-            changes: [
-                { type: 'feature', text: '菜单管理: 新增侧边栏菜单显示/隐藏功能' },
-                { type: 'feature', text: '在系统设置中可自定义显示哪些菜单项' }
-            ]
-        },
-        {
-            version: 'v1.1.5',
-            date: '2026-01-27',
-            changes: [
-                { type: 'feature', text: '主题设置: 新增主题颜色自定义功能' },
-                { type: 'feature', text: '提供9种预设颜色，支持自定义任意颜色' },
-                { type: 'optimize', text: '系统设置界面简化，操作更直观' }
-            ]
-        },
-        {
-            version: 'v1.1.4',
-            date: '2026-01-27',
-            changes: [
-                { type: 'feature', text: '订单管理: 新增买家昵称列' },
-                { type: 'feature', text: '订单搜索支持按买家昵称搜索' },
-                { type: 'optimize', text: '数据库: 自动迁移添加 buyer_nick 字段' }
-            ]
-        },
-        {
-            version: 'v1.1.3',
-            date: '2026-01-27',
-            changes: [
-                { type: 'optimize', text: '系统设置: 优化"登录与注册设置"卡片布局' }
-            ]
-        },
-        {
-            version: 'v1.1.2',
-            date: '2026-01-27',
-            changes: [
-                { type: 'optimize', text: '在线客服: 修复页面底部白色空白区域问题' },
-                { type: 'optimize', text: '系统设置: 重新组织页面布局' }
-            ]
-        },
-        {
-            version: 'v1.1.1',
-            date: '2026-01-27',
-            changes: [
-                { type: 'feature', text: '在线客服: 优化账号密码显示布局' },
-                { type: 'feature', text: 'API: cookies/details 接口新增返回 password 字段' },
-                { type: 'optimize', text: 'UI: 添加 favicon 图标' }
-            ]
-        },
-        {
-            version: 'v1.1.0',
-            date: '2026-01-25',
-            changes: [
-                { type: 'feature', text: '添加登录页面验证码开关功能' },
-                { type: 'feature', text: '优化订单管理功能' },
-                { type: 'feature', text: '添加手动发货和刷新订单状态功能' },
-                { type: 'fix', text: '修复自动发货模块语法错误导致账号无法启动的问题' }
-            ]
-        },
-        {
-            version: 'v1.0.0',
-            date: '2026-01-24',
-            changes: [
-                { type: 'feature', text: '闲鱼自动回复系统初始版本' }
-            ]
-        }
-    ];
+    // 从 LOCAL_VERSION_HISTORY 统一读取，避免维护两份数据
+    const prefixTypeMap = {
+        '新功能': 'feature',
+        '优化': 'optimize',
+        '修复': 'fix'
+    };
+    const changelog = LOCAL_VERSION_HISTORY.versionHistory.map(v => ({
+        version: v.version,
+        date: v.date,
+        changes: v.updates.map(text => {
+            let type = 'feature';
+            let cleanText = text;
+            const match = text.match(/^【(.+?)】(.+)$/);
+            if (match) {
+                if (prefixTypeMap[match[1]]) {
+                    type = prefixTypeMap[match[1]];
+                    cleanText = match[2];
+                } else {
+                    // 模块名前缀（如【菜单管理】），保留完整文本
+                    type = 'feature';
+                    cleanText = text;
+                }
+            }
+            return { type, text: cleanText };
+        })
+    }));
 
     // 生成HTML
     const html = changelog.map(release => {
