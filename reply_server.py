@@ -2940,6 +2940,18 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
         # 第一步：使用扫码cookie获取真实cookie
         log_with_user('info', f"开始使用扫码cookie获取真实cookie: {account_id}", current_user)
 
+        # 记录扫码登录到风控日志
+        risk_log_id = None
+        try:
+            risk_log_id = db_manager.add_risk_control_log(
+                cookie_id=account_id,
+                event_type='cookie_refresh',
+                event_description=f"扫码登录获取真实Cookie（{'新账号' if is_new_account else '已有账号'}）",
+                processing_status='processing'
+            )
+        except Exception as log_e:
+            logger.error(f"记录风控日志失败: {log_e}")
+
         try:
             # 创建一个临时的XianyuLive实例来执行cookie刷新
             from XianyuAutoAsync import XianyuLive
@@ -2977,6 +2989,13 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
                             log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
 
+                    # 更新风控日志状态
+                    if risk_log_id:
+                        try:
+                            db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='success', processing_result='扫码登录真实Cookie获取成功')
+                        except Exception:
+                            pass
+
                     return {
                         'account_id': account_id,
                         'is_new_account': is_new_account,
@@ -2985,15 +3004,30 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     }
                 else:
                     log_with_user('error', f"无法从数据库获取真实cookie: {account_id}", current_user)
+                    if risk_log_id:
+                        try:
+                            db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message='无法从数据库获取真实cookie')
+                        except Exception:
+                            pass
                     # 降级处理：使用原始扫码cookie
                     return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "无法从数据库获取真实cookie")
             else:
                 log_with_user('warning', f"扫码登录真实cookie获取失败: {account_id}", current_user)
+                if risk_log_id:
+                    try:
+                        db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message='真实cookie获取失败')
+                    except Exception:
+                        pass
                 # 降级处理：使用原始扫码cookie
                 return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "真实cookie获取失败")
 
         except Exception as refresh_e:
             log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
+            if risk_log_id:
+                try:
+                    db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message=str(refresh_e)[:200])
+                except Exception:
+                    pass
             # 降级处理：使用原始扫码cookie
             return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, f"获取真实cookie异常: {str(refresh_e)}")
 
