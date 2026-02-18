@@ -6057,14 +6057,15 @@ def test_ai_reply(cookie_id: str, test_data: dict, current_user: Dict[str, Any] 
             'desc': test_data.get('item_desc', '这是一个测试商品')
         }
 
-        # 生成测试回复
+        # 生成测试回复（跳过去抖等待）
         reply = ai_reply_engine.generate_reply(
             message=test_message,
             item_info=test_item_info,
             chat_id=f"test_{int(time.time())}",
             cookie_id=cookie_id,
             user_id="test_user",
-            item_id="test_item"
+            item_id="test_item",
+            skip_wait=True
         )
 
         if reply:

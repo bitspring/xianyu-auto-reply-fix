@@ -1035,9 +1035,14 @@ function renderKeywordsList(keywords) {
             `;
     } else {
             replyDisplay = `
-                <div class="keyword-group-reply">
-                    <strong>回复内容：</strong>
-                    <span class="reply-text-content">${group.reply || '<span class="text-muted">（空回复，不自动回复）</span>'}</span>
+                <div class="keyword-group-reply" id="reply-display-${groupIndex}">
+                    <div class="d-flex align-items-center">
+                        <strong>回复内容：</strong>
+                        <span class="reply-text-content">${group.reply || '<span class="text-muted">（空回复，不自动回复）</span>'}</span>
+                        <button class="reply-edit-btn" onclick="editGroupReply(${groupIndex})" title="编辑回复内容">
+                            <i class="bi bi-pencil"></i> 编辑
+                        </button>
+                    </div>
                 </div>
             `;
     }
@@ -1181,6 +1186,107 @@ function getItemName(itemId, itemTitle) {
 // 聚焦到关键词输入框
 function focusKeywordInput() {
     document.getElementById('newKeyword').focus();
+}
+
+// 编辑分组回复内容（就地编辑）
+function editGroupReply(groupIndex) {
+    const keywords = keywordsData[currentCookieId] || [];
+    const groups = groupKeywordsByReply(keywords);
+    const group = groups[groupIndex];
+
+    if (!group) {
+        showToast('找不到关键词分组', 'warning');
+        return;
+    }
+
+    const container = document.getElementById(`reply-display-${groupIndex}`);
+    if (!container) return;
+
+    // 转义HTML用于textarea
+    const replyText = group.reply || '';
+
+    container.innerHTML = `
+        <strong>回复内容：</strong>
+        <div class="reply-edit-area">
+            <textarea class="reply-edit-textarea" id="reply-edit-input-${groupIndex}" rows="3" placeholder="请输入回复内容">${replyText}</textarea>
+            <div class="reply-edit-actions">
+                <button class="reply-cancel-btn" onclick="cancelGroupReplyEdit(${groupIndex})">
+                    <i class="bi bi-x-lg"></i> 取消
+                </button>
+                <button class="reply-save-btn" onclick="saveGroupReply(${groupIndex})">
+                    <i class="bi bi-check-lg"></i> 保存
+                </button>
+            </div>
+        </div>
+    `;
+
+    // 聚焦并将光标移到末尾
+    const textarea = document.getElementById(`reply-edit-input-${groupIndex}`);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+// 取消编辑分组回复
+function cancelGroupReplyEdit(groupIndex) {
+    const keywords = keywordsData[currentCookieId] || [];
+    renderKeywordsList(keywords);
+}
+
+// 保存分组回复内容
+async function saveGroupReply(groupIndex) {
+    const keywords = keywordsData[currentCookieId] || [];
+    const groups = groupKeywordsByReply(keywords);
+    const group = groups[groupIndex];
+
+    if (!group) {
+        showToast('找不到关键词分组', 'warning');
+        return;
+    }
+
+    const textarea = document.getElementById(`reply-edit-input-${groupIndex}`);
+    if (!textarea) return;
+
+    const newReply = textarea.value.trim();
+
+    // 更新所有属于该分组的关键词回复内容
+    const updatedKeywords = keywords.map((item, index) => {
+        if (group.indices.includes(index)) {
+            return { ...item, reply: newReply };
+        }
+        return item;
+    });
+
+    // 提取文本类型的关键词用于保存
+    const textKeywords = updatedKeywords.filter(item => (item.type || 'text') === 'text');
+
+    try {
+        toggleLoading(true);
+
+        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({
+                keywords: textKeywords
+            })
+        });
+
+        if (response.ok) {
+            showToast(`回复内容已更新（影响${group.indices.length}条配置）`, 'success');
+            await refreshKeywordsList();
+        } else {
+            const errorText = await response.text();
+            console.error('更新回复内容失败:', errorText);
+            showToast('更新回复内容失败', 'danger');
+        }
+    } catch (error) {
+        console.error('更新回复内容失败:', error);
+        showToast('更新回复内容失败', 'danger');
+    } finally {
+        toggleLoading(false);
+    }
 }
 
 // 编辑关键词 - 改进版本
@@ -2878,15 +2984,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // 增强的键盘快捷键和用户体验
-    document.getElementById('newKeyword')?.addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
+    // textarea 中 Enter 允许换行，Ctrl+Enter 提交
+    document.getElementById('newKeyword')?.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
-        document.getElementById('newReply').focus();
+        addKeyword();
     }
     });
 
-    document.getElementById('newReply')?.addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
+    document.getElementById('newReply')?.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
         addKeyword();
     }
@@ -3231,7 +3338,7 @@ async function configAIReply(accountId) {
     const customModelInput = document.getElementById('customModelName');
     const modelName = settings.model_name;
     // 检查是否是预设模型
-    const presetModels = ['qwen-plus', 'qwen-turbo', 'qwen-max', 'gpt-3.5-turbo', 'gpt-4'];
+    const presetModels = ['deepseek-v3.2', 'kimi-k2.5', 'qwen3-max-2026-01-23', 'qwen3.5-plus', 'gpt-4o-mini', 'gpt-4o'];
     if (presetModels.includes(modelName)) {
         modelSelect.value = modelName;
         customModelInput.style.display = 'none';
@@ -3247,7 +3354,14 @@ async function configAIReply(accountId) {
     document.getElementById('maxDiscountPercent').value = settings.max_discount_percent;
     document.getElementById('maxDiscountAmount').value = settings.max_discount_amount;
     document.getElementById('maxBargainRounds').value = settings.max_bargain_rounds;
-    document.getElementById('customPrompts').value = settings.custom_prompts;
+    // 解析自定义提示词 JSON，填入三个独立文本框
+    let prompts = {};
+    if (settings.custom_prompts) {
+        try { prompts = JSON.parse(settings.custom_prompts); } catch (e) { prompts = {}; }
+    }
+    document.getElementById('promptPrice').value = prompts.price || '';
+    document.getElementById('promptTech').value = prompts.tech || '';
+    document.getElementById('promptDefault').value = prompts.default || '';
 
     // 切换设置显示状态
     toggleAIReplySettings();
@@ -3296,17 +3410,6 @@ async function saveAIReplyConfig() {
         showToast('请输入API密钥', 'warning');
         return;
         }
-
-        // 验证自定义提示词格式
-        const customPrompts = document.getElementById('customPrompts').value.trim();
-        if (customPrompts) {
-        try {
-            JSON.parse(customPrompts);
-        } catch (e) {
-            showToast('自定义提示词格式错误，请检查JSON格式', 'warning');
-            return;
-        }
-        }
     }
 // 获取模型名称
     let modelName = document.getElementById('aiModelName').value;
@@ -3318,6 +3421,16 @@ async function saveAIReplyConfig() {
         }
         modelName = customModelName;
     }
+    // 从三个文本框组装自定义提示词 JSON
+    const promptsObj = {};
+    const priceVal = document.getElementById('promptPrice').value.trim();
+    const techVal = document.getElementById('promptTech').value.trim();
+    const defaultVal = document.getElementById('promptDefault').value.trim();
+    if (priceVal) promptsObj.price = priceVal;
+    if (techVal) promptsObj.tech = techVal;
+    if (defaultVal) promptsObj.default = defaultVal;
+    const customPromptsJson = Object.keys(promptsObj).length > 0 ? JSON.stringify(promptsObj) : '';
+
     // 构建设置对象
     const settings = {
         ai_enabled: enabled,
@@ -3327,7 +3440,7 @@ async function saveAIReplyConfig() {
         max_discount_percent: parseInt(document.getElementById('maxDiscountPercent').value),
         max_discount_amount: parseInt(document.getElementById('maxDiscountAmount').value),
         max_bargain_rounds: parseInt(document.getElementById('maxBargainRounds').value),
-        custom_prompts: document.getElementById('customPrompts').value
+        custom_prompts: customPromptsJson
     };
 
     // 保存设置
@@ -3357,6 +3470,10 @@ async function saveAIReplyConfig() {
 
 // 测试AI回复
 async function testAIReply() {
+    const testBtn = document.querySelector('[onclick="testAIReply()"]');
+    if (testBtn && testBtn.disabled) return;
+    if (testBtn) { testBtn.disabled = true; testBtn.textContent = '测试中...'; }
+
     try {
     const accountId = document.getElementById('aiConfigAccountId').value;
     const testMessage = document.getElementById('testMessage').value.trim();
@@ -3406,6 +3523,8 @@ async function testAIReply() {
     const testReplyContent = document.getElementById('testReplyContent');
     testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${error.message}</span>`;
     showToast('测试AI回复失败', 'danger');
+    } finally {
+    if (testBtn) { testBtn.disabled = false; testBtn.textContent = '测试回复'; }
     }
 }
 
@@ -13439,7 +13558,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.2.5';
+const DEFAULT_VERSION = 'v1.2.6';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -13452,9 +13571,21 @@ let remoteVersionInfo = null;
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.2.5',
+    version: 'v1.2.6',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.2.6',
+            date: '2026-02-18',
+            updates: [
+                '【优化】AI回复配置：修复模型下拉框HTML标签错误，更新可用模型列表（新增deepseek-v3.2、kimi-k2.5等）',
+                '【优化】自定义提示词：从单JSON输入改为议价/技术/一般三个独立输入框，操作更直观',
+                '【优化】关键词输入：输入框改为多行文本域，支持竖线和换行分隔批量添加',
+                '【新功能】关键词回复内容支持就地编辑，无需重新添加即可修改回复文本',
+                '【优化】暗色模式全面适配：关键词管理、账号管理、扫码登录弹窗、全局滚动条',
+                '【修复】关键词输入区域布局错乱问题'
+            ]
+        },
         {
             version: 'v1.2.5',
             date: '2026-02-12',
