@@ -61,6 +61,7 @@ Thumbs.db
 # Local environment files
 .env.local
 .env.*.local
+update_files.json
 
 # ==================== 项目特定文件 ====================
 # 日志文件

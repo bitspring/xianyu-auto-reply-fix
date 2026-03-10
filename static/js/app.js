@@ -14883,9 +14883,19 @@ let remoteVersionInfo = null;
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.5.4',
+    version: 'v1.5.5',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.5.5',
+            date: '2026-03-11',
+            updates: [
+                '【新功能】热更新清单改为自动扫描 Python、HTML、静态资源和前端源码文件，无需手动维护白名单',
+                '【新功能】新增发版预检查脚本，可在发布前检查版本号、改名/删除文件和未跟踪热更新文件',
+                '【新功能】热更新支持按清单删除旧文件，删除前会自动备份，降低改名和清理残留文件的风险',
+                '【优化】update_files.json 改为由 GitHub Actions 自动生成并上传到 Release，仓库内不再手动维护'
+            ]
+        },
         {
             version: 'v1.5.4',
             date: '2026-03-10',
@@ -16256,13 +16266,15 @@ async function performHotUpdate() {
         if (result.success && result.data.success) {
             // 更新成功
             const updateData = result.data;
+            const updatedCount = updateData.updated_files?.length || 0;
+            const deletedCount = updateData.deleted_files?.length || 0;
             
             if (updateData.needs_restart) {
                 // 需要重启
                 showHotUpdateRestartDialog(updateData);
             } else {
                 // 不需要重启，刷新页面即可
-                showToast(`更新成功！共更新 ${updateData.updated_files.length} 个文件`, 'success');
+                showToast(`更新成功！更新 ${updatedCount} 个文件，删除 ${deletedCount} 个旧文件`, 'success');
                 
                 // 3秒后刷新页面
                 setTimeout(() => {
@@ -16320,9 +16332,25 @@ async function showHotUpdateConfirmDialog(updateInfo) {
     return new Promise((resolve) => {
         const filesInfo = updateInfo.files && updateInfo.files.length > 0
             ? updateInfo.files.map(f => `<li><code>${f.path}</code> ${f.requires_restart ? '<span class="badge bg-warning">需重启</span>' : ''}</li>`).join('')
-            : '<li>暂无详细文件列表</li>';
+            : '<li>本次无新增或覆盖文件</li>';
+        const deletedFilesInfo = updateInfo.deleted_files && updateInfo.deleted_files.length > 0
+            ? updateInfo.deleted_files.map(f => `<li><code>${f.path}</code> ${f.requires_restart ? '<span class="badge bg-warning">需重启</span>' : ''}</li>`).join('')
+            : '';
         
         const totalSizeKB = (updateInfo.total_size / 1024).toFixed(2);
+        const deletedCount = updateInfo.deleted_files_count || 0;
+        const deleteSection = deletedCount > 0 ? `
+                            <div class="mb-3">
+                                <div style="color: #444; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                                    <i class="bi bi-trash me-1"></i>将删除以下旧文件：
+                                </div>
+                                <div style="max-height: 120px; overflow-y: auto; background: #fff3f3; border-radius: 8px; padding: 12px; border: 1px solid #f5c2c7;">
+                                    <ul class="list-unstyled mb-0" style="font-size: 13px;">
+                                        ${deletedFilesInfo}
+                                    </ul>
+                                </div>
+                            </div>
+        ` : '';
         
         const modalHtml = `
             <div class="modal fade" id="hotUpdateConfirmModal" tabindex="-1">
@@ -16352,6 +16380,10 @@ async function showHotUpdateConfirmDialog(updateInfo) {
                                     <span style="color: #666;"><i class="bi bi-files me-1"></i>更新文件数</span>
                                     <span style="font-weight: 600; color: #333;">${updateInfo.files_count} 个</span>
                                 </div>
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <span style="color: #666;"><i class="bi bi-trash me-1"></i>删除旧文件数</span>
+                                    <span style="font-weight: 600; color: #333;">${deletedCount} 个</span>
+                                </div>
                                 <div class="d-flex justify-content-between align-items-center">
                                     <span style="color: #666;"><i class="bi bi-hdd me-1"></i>下载大小</span>
                                     <span style="font-weight: 600; color: #333;">${totalSizeKB} KB</span>
@@ -16368,10 +16400,11 @@ async function showHotUpdateConfirmDialog(updateInfo) {
                                     </ul>
                                 </div>
                             </div>
+                            ${deleteSection}
                             
                             <div class="rounded-3 p-3" style="background: linear-gradient(135deg, #fff3cd, #ffeeba); color: #856404; font-size: 14px;">
                                 <i class="bi bi-exclamation-triangle me-2"></i>
-                                <strong>提示：</strong>更新前会自动备份原文件，如遇问题可恢复。
+                                <strong>提示：</strong>更新和删除前都会自动备份原文件，如遇问题可恢复。
                             </div>
                         </div>
                         <div class="modal-footer py-3" style="background: #fff; border-top: 1px solid #e8ecf0;">

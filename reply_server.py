@@ -8319,6 +8319,7 @@ class UpdateResultResponse(PydanticBaseModel):
     success: bool
     message: str
     updated_files: list = []
+    deleted_files: list = []
     needs_restart: bool = False
     new_version: str = ""
 
@@ -8346,9 +8347,10 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
         
         # 获取需要更新的文件
         files_to_update = await updater.get_files_to_update(manifest)
+        files_to_delete = await updater.get_files_to_delete(manifest)
         total_size = sum(f.size for f in files_to_update)
 
-        if not files_to_update:
+        if not files_to_update and not files_to_delete:
             return {
                 "success": True,
                 "data": {
@@ -8367,6 +8369,7 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
                 "description": manifest.description,
                 "changelog": manifest.changelog or [],
                 "files_count": len(files_to_update),
+                "deleted_files_count": len(files_to_delete),
                 "total_size": total_size,
                 "release_date": manifest.release_date,
                 "files": [
@@ -8377,6 +8380,14 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
                         "description": f.description
                     }
                     for f in files_to_update
+                ],
+                "deleted_files": [
+                    {
+                        "path": f.path,
+                        "requires_restart": f.requires_restart,
+                        "description": f.description
+                    }
+                    for f in files_to_delete
                 ]
             }
         }

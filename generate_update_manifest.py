@@ -16,42 +16,63 @@ import os
 import sys
 import json
 import hashlib
+import subprocess
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Set
 
 DEFAULT_GITHUB_OWNER = "GuDong2003"
 DEFAULT_GITHUB_REPO = "xianyu-auto-reply-fix"
 
-# 可更新的文件列表（相对路径）
-UPDATABLE_FILES = [
-    # 前端文件（不需要重启）
-    'static/version.txt',
-    'static/index.html',
-    'static/js/app.js',
-    # 后端核心文件（需要重启）
-    'auto_updater.py',
-    'reply_server.py',
-    'XianyuAutoAsync.py',
-    'db_manager.py',
-    # 'cookie_manager.py',
-    # 'ai_reply_engine.py',
-    # 'auto_updater.py',
-    # 'config.py',
-    # 'Start.py',
-    
-    # 工具文件
-    # 'utils/xianyu_utils.py',
-    # 'utils/message_utils.py',
-    # 'utils/image_utils.py',
-    # 'utils/qr_login.py',
-    # 'utils/refresh_util.py',
-    
-    # 配置文件模板（不更新用户的实际配置）
-    # 'global_config.yml',  # 用户配置，不更新
-]
+# static 目录下允许热更新的静态资源类型
+STATIC_ASSET_EXTENSIONS = {
+    '.css', '.eot', '.gif', '.html', '.ico', '.jpeg', '.jpg',
+    '.js', '.json', '.map', '.otf', '.png', '.svg', '.ttf',
+    '.txt', '.webp', '.woff', '.woff2',
+}
+
+# 前端源码目录下允许热更新的源码类型
+FRONTEND_SOURCE_DIRS = {'static', 'frontend'}
+FRONTEND_SOURCE_EXTENSIONS = {'.ts', '.tsx', '.jsx', '.vue'}
 
 # 不需要重启的文件扩展名
-NO_RESTART_EXTENSIONS = {'.js', '.css', '.html', '.json', '.yml', '.yaml'}
+NO_RESTART_EXTENSIONS = (
+    STATIC_ASSET_EXTENSIONS
+    | FRONTEND_SOURCE_EXTENSIONS
+    | {'.yml', '.yaml'}
+)
+
+# 扫描时排除的目录
+EXCLUDED_DIR_NAMES = {
+    '.pytest_cache',
+    '.git',
+    '.github',
+    '.claude',
+    '.ace-tool',
+    '__pycache__',
+    'browser_data',
+    'build',
+    'data',
+    'dist',
+    'logs',
+    'nginx',
+    'node_modules',
+    'qr_screenshots',
+    'trajectory_history',
+    'update_backup',
+    'uploads',
+    'venv',
+}
+
+# 即使文件类型匹配也不纳入热更新的文件
+EXCLUDED_FILE_NAMES = {
+    'Dockerfile',
+    'Dockerfile-cn',
+    'docker-compose.yml',
+    'docker-compose-cn.yml',
+    'global_config.yml',
+    'update_files.json',
+}
 
 
 def calculate_md5(file_path: Path) -> str:
@@ -77,6 +98,151 @@ def needs_restart(file_path: str) -> bool:
     """判断文件更新是否需要重启"""
     ext = Path(file_path).suffix.lower()
     return ext not in NO_RESTART_EXTENSIONS
+
+
+def normalize_manifest_path(path: str) -> str:
+    """规范化清单中的路径字符串"""
+    return path.replace('\\', '/').lstrip('/')
+
+
+def normalize_relative_path(path: Path) -> str:
+    """规范化相对路径"""
+    return path.as_posix()
+
+
+def is_excluded_path(relative_path: Path) -> bool:
+    """检查路径是否属于排除项"""
+    if relative_path.name.startswith('.'):
+        return True
+
+    if relative_path.name in EXCLUDED_FILE_NAMES:
+        return True
+
+    return any(part in EXCLUDED_DIR_NAMES for part in relative_path.parts)
+
+
+def is_updatable_file(relative_path: Path) -> bool:
+    """判断文件是否应纳入热更新清单"""
+    if is_excluded_path(relative_path):
+        return False
+
+    suffix = relative_path.suffix.lower()
+    if suffix == '.py':
+        return True
+
+    if suffix == '.html':
+        return True
+
+    if not relative_path.parts:
+        return False
+
+    root_dir = relative_path.parts[0]
+    if root_dir == 'static' and suffix in STATIC_ASSET_EXTENSIONS:
+        return True
+
+    return root_dir in FRONTEND_SOURCE_DIRS and suffix in FRONTEND_SOURCE_EXTENSIONS
+
+
+def collect_updatable_files(base_dir: Path) -> List[str]:
+    """自动扫描可热更新的业务文件和静态资源"""
+    files: List[str] = []
+
+    for root, dirnames, filenames in os.walk(base_dir, topdown=True):
+        root_path = Path(root)
+        relative_root = root_path.relative_to(base_dir)
+
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if not is_excluded_path(relative_root / dirname)
+        )
+
+        for filename in sorted(filenames):
+            relative_path = relative_root / filename
+            if is_updatable_file(relative_path):
+                files.append(normalize_relative_path(relative_path))
+
+    return sorted(files)
+
+
+def run_git_command(base_dir: Path, args: List[str]) -> str:
+    """执行 git 命令并返回标准输出"""
+    result = subprocess.run(
+        ['git', '-C', str(base_dir), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def get_previous_release_tag(base_dir: Path, current_version: str) -> Optional[str]:
+    """获取当前版本之前的最近一个 tag"""
+    try:
+        output = run_git_command(base_dir, ['tag', '--list', 'v*', '--sort=-version:refname'])
+    except Exception:
+        return None
+
+    for raw_tag in output.splitlines():
+        tag = raw_tag.strip()
+        if tag and tag != current_version:
+            return tag
+
+    return None
+
+
+def load_manifest_from_tag(base_dir: Path, tag: Optional[str]) -> Optional[Dict[str, Any]]:
+    """从历史 tag 中加载 update_files.json"""
+    if not tag:
+        return None
+
+    try:
+        manifest_text = run_git_command(base_dir, ['show', f'{tag}:update_files.json'])
+    except Exception as exc:
+        print(f"提示: 无法从 tag {tag} 读取 update_files.json: {exc}")
+        return None
+
+    try:
+        return json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        print(f"提示: tag {tag} 的 update_files.json 解析失败: {exc}")
+        return None
+
+
+def extract_manifest_paths(entries: List[Any]) -> Set[str]:
+    """从 manifest 条目中提取路径集合"""
+    paths: Set[str] = set()
+
+    for entry in entries or []:
+        if isinstance(entry, dict):
+            path = entry.get('path', '')
+        else:
+            path = str(entry)
+
+        path = normalize_manifest_path(path).strip()
+        if path:
+            paths.add(path)
+
+    return paths
+
+
+def build_deleted_files(current_paths: Set[str], previous_manifest: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """基于历史 manifest 生成累积删除列表"""
+    if not previous_manifest:
+        return []
+
+    previous_paths = extract_manifest_paths(previous_manifest.get('files', []))
+    historical_deleted_paths = extract_manifest_paths(previous_manifest.get('deleted_files', []))
+    deleted_paths = sorted((historical_deleted_paths | (previous_paths - current_paths)) - current_paths)
+
+    return [
+        {
+            'path': path,
+            'requires_restart': needs_restart(path),
+            'description': '',
+        }
+        for path in deleted_paths
+    ]
 
 
 def build_raw_download_url(owner: str, repo: str, version: str, relative_path: str) -> str:
@@ -115,21 +281,18 @@ def generate_manifest(
     base_dir: Path,
     version: str = "v1.0.0",
     owner: str = DEFAULT_GITHUB_OWNER,
-    repo: str = DEFAULT_GITHUB_REPO
+    repo: str = DEFAULT_GITHUB_REPO,
+    previous_manifest: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """生成更新清单"""
     files = []
-    
-    for file_path in UPDATABLE_FILES:
+
+    for file_path in collect_updatable_files(base_dir):
         full_path = base_dir / file_path
-        
-        if not full_path.exists():
-            print(f"警告: 文件不存在 - {file_path}")
-            continue
-        
+
         md5 = calculate_md5(full_path)
         size = get_file_size(full_path)
-        
+
         files.append({
             'path': file_path.replace('\\', '/'),
             'md5': md5,
@@ -138,6 +301,9 @@ def generate_manifest(
             'requires_restart': needs_restart(file_path),
             'description': '',
         })
+
+    current_paths = {file_info['path'] for file_info in files}
+    deleted_files = build_deleted_files(current_paths, previous_manifest)
     
     manifest = {
         'version': version,
@@ -148,6 +314,7 @@ def generate_manifest(
             'GitHub Releases 热更新清单',
         ],
         'files': files,
+        'deleted_files': deleted_files,
     }
     
     return manifest
@@ -162,6 +329,7 @@ def print_manifest_summary(manifest: dict):
     print(f"版本号: {manifest['version']}")
     print(f"发布日期: {manifest['release_date']}")
     print(f"文件数量: {len(manifest['files'])}")
+    print(f"待删除文件数量: {len(manifest.get('deleted_files', []))}")
     total_size = sum(f['size'] for f in manifest['files'])
     print(f"总大小: {total_size / 1024:.2f} KB")
     print("示例下载地址:")
@@ -186,13 +354,17 @@ def main():
         owner = sys.argv[3]
     if len(sys.argv) > 4:
         repo = sys.argv[4]
+
+    previous_tag = get_previous_release_tag(base_dir, version)
+    previous_manifest = load_manifest_from_tag(base_dir, previous_tag)
     
     print(f"项目目录: {base_dir}")
     print(f"版本号: {version}")
     print(f"GitHub 仓库: {owner}/{repo}")
+    print(f"上一版本标签: {previous_tag or '无'}")
     
     # 生成清单
-    manifest = generate_manifest(base_dir, version, owner, repo)
+    manifest = generate_manifest(base_dir, version, owner, repo, previous_manifest=previous_manifest)
     
     # 保存JSON文件
     output_file = base_dir / "update_files.json"
@@ -207,13 +379,12 @@ def main():
     print("使用说明")
     print("=" * 60)
     print("""
-1. 将当前版本代码提交并打上 Git tag（如 v1.5.0）
-2. 发布 GitHub Release，并确保对应 tag 已存在
-3. 生成的 update_files.json 会上传到 GitHub Release 作为更新清单
+1. 修改业务 Python 文件、HTML 页面或 static/ 下的静态资源
+2. 更新 static/version.txt 为新的版本号后提交并 push 到 main
+3. GitHub Actions 会自动扫描可热更新文件，生成 update_files.json 并创建同名 Release
 4. 用户在前端点击"一键热更新"后，会先读取 GitHub Releases 最新版本，再从对应 tag 下载文件
 """)
 
 
 if __name__ == '__main__':
     main()
-
