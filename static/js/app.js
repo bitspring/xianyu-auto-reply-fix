@@ -969,11 +969,26 @@ function isCompletionEligibleOrder(normalizedStatus) {
     return completionEligibleStatuses.includes(normalizedStatus);
 }
 
-function isTodayOrder(createdAt) {
-    if (!createdAt) return false;
+function parseUtcDateTime(dateString) {
+    if (!dateString) return null;
 
-    const orderDate = new Date(createdAt);
-    if (Number.isNaN(orderDate.getTime())) return false;
+    if (dateString instanceof Date) {
+        return Number.isNaN(dateString.getTime()) ? null : dateString;
+    }
+
+    const raw = String(dateString).trim();
+    if (!raw) return null;
+
+    const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+    const hasTimezone = /([zZ]|[+-]\d{2}:\d{2})$/.test(normalized);
+    const parsed = new Date(hasTimezone ? normalized : `${normalized}Z`);
+
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isTodayOrder(createdAt) {
+    const orderDate = parseUtcDateTime(createdAt);
+    if (!orderDate) return false;
 
     const now = new Date();
     return (
@@ -5918,7 +5933,7 @@ function renderCardsList(cards) {
         <td>${delayDisplay}</td>
         <td>${statusBadge}</td>
         <td>
-        <small class="text-muted">${new Date(card.created_at).toLocaleString('zh-CN')}</small>
+        <small class="text-muted">${formatDateTime(card.created_at)}</small>
         </td>
         <td>
         <div class="btn-group" role="group">
@@ -9122,14 +9137,8 @@ function updateItemReplyBatchDeleteButton() {
 
 // 格式化日期时间
 function formatDateTime(dateString) {
-    if (!dateString) return '未知';
-    // 如果是ISO格式，直接new Date
-    if (dateString.includes('T') && dateString.endsWith('Z')) {
-        return new Date(dateString).toLocaleString('zh-CN');
-    }
-    // 否则按原有逻辑（可选：补偿8小时）
-    const date = new Date(dateString.replace(' ', 'T') + 'Z');
-    return date.toLocaleString('zh-CN');
+    const date = parseUtcDateTime(dateString);
+    return date ? date.toLocaleString('zh-CN') : '未知';
 }
 
 // HTML转义函数
@@ -12293,7 +12302,11 @@ async function loadAllOrders() {
         if (data.success) {
             allOrdersData = data.data || [];
             // 按创建时间倒序排列
-            allOrdersData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            allOrdersData.sort((a, b) => {
+                const bTime = parseUtcDateTime(b.created_at)?.getTime() || 0;
+                const aTime = parseUtcDateTime(a.created_at)?.getTime() || 0;
+                return bTime - aTime;
+            });
 
             // 应用当前筛选条件
             filterOrders(false);
@@ -14988,9 +15001,20 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.5.8',
+    version: 'v1.5.9',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.5.9',
+            date: '2026-03-11',
+            updates: [
+                '【修复】买家昵称过滤系统文案，避免订单和发货日志写入错误昵称',
+                '【修复】小刀订单商品归属增加回退校验，避免缓存未命中时误跳过自动发货',
+                '【修复】连续下单场景下旧关单消息串到新订单的问题',
+                '【修复】sid 简化消息将已处理订单误报为未找到订单的问题',
+                '【优化】前端时间显示与销售统计统一按北京时间口径处理'
+            ]
+        },
         {
             version: 'v1.5.8',
             date: '2026-03-11',

@@ -12,6 +12,7 @@ import time
 import json
 import os
 import re
+from datetime import timedelta
 import uvicorn
 import pandas as pd
 import io
@@ -26,6 +27,13 @@ from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.time_utils import (
+    get_local_now,
+    local_date_to_utc_end_exclusive,
+    local_date_to_utc_start,
+    utc_timestamp_to_local_date_string,
+    utc_timestamp_to_local_datetime,
+)
 from order_event_hub import order_event_hub, publish_order_update_event
 
 from loguru import logger
@@ -1278,11 +1286,17 @@ async def get_sales_data(
         params = list(cookie_ids)
         
         if start_date:
+            utc_start = local_date_to_utc_start(start_date)
+            if not utc_start:
+                raise HTTPException(status_code=400, detail='开始日期格式错误，应为 YYYY-MM-DD')
             query += " AND created_at >= ?"
-            params.append(start_date)
+            params.append(utc_start)
         if end_date:
-            query += " AND created_at <= ?"
-            params.append(end_date + " 23:59:59")
+            utc_end_exclusive = local_date_to_utc_end_exclusive(end_date)
+            if not utc_end_exclusive:
+                raise HTTPException(status_code=400, detail='结束日期格式错误，应为 YYYY-MM-DD')
+            query += " AND created_at < ?"
+            params.append(utc_end_exclusive)
         
         # 执行查询
         orders = db_manager.execute_query(query, params)
@@ -1301,16 +1315,17 @@ async def get_sales_data(
                 # 移除货币符号和逗号
                 amount_clean = amount_str.replace('￥', '').replace(',', '')
                 amount = float(amount_clean)
+                local_date = utc_timestamp_to_local_date_string(created_at)
+                if not local_date:
+                    continue
+
                 total_sales += amount
                 valid_count += 1
                 
-                # 格式化为日期
-                date = created_at.split(' ')[0] if ' ' in created_at else created_at
-                
                 # 直接按日期分组
-                if date not in sales_by_date:
-                    sales_by_date[date] = 0
-                sales_by_date[date] += amount
+                if local_date not in sales_by_date:
+                    sales_by_date[local_date] = 0
+                sales_by_date[local_date] += amount
             except (ValueError, TypeError):
                 # 跳过无效金额
                 continue
@@ -1334,6 +1349,8 @@ async def get_sales_data(
             'message': '获取销售额数据成功'
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取销售额数据失败: {e}")
         return {
@@ -1353,7 +1370,6 @@ async def get_sales_summary(
     """
     try:
         from db_manager import db_manager
-        from datetime import datetime, timedelta
 
         current_user_id = (user_info or {}).get('user_id')
         if current_user_id is None:
@@ -1362,7 +1378,7 @@ async def get_sales_summary(
         user_cookies = db_manager.get_all_cookies(current_user_id)
         cookie_ids = list(user_cookies.keys())
         if not cookie_ids:
-            now = datetime.now()
+            now = get_local_now()
             return {
                 'success': True,
                 'data': {
@@ -1375,23 +1391,25 @@ async def get_sales_summary(
             }
         
         # 计算时间范围
-        now = datetime.now()
+        now = get_local_now()
         
         # 当日开始
-        today_start_str = now.strftime('%Y-%m-%d')
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_str = today_start.strftime('%Y-%m-%d')
         
         # 本周开始（周一）
-        week_start = now - timedelta(days=now.weekday())
+        week_start = today_start - timedelta(days=today_start.weekday())
         week_start_str = week_start.strftime('%Y-%m-%d')
         
         # 本月开始
-        month_start = now.replace(day=1)
+        month_start = today_start.replace(day=1)
         month_start_str = month_start.strftime('%Y-%m-%d')
         
         # 单次查询获取所有数据，减少数据库访问
         placeholders = ','.join(['?'] * len(cookie_ids))
+        month_start_utc = local_date_to_utc_start(month_start_str)
         query = f"SELECT amount, created_at FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
-        all_orders = db_manager.execute_query(query, [month_start_str] + cookie_ids)
+        all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
         
         # 计算销售额
         today_sales = 0.0
@@ -1405,17 +1423,20 @@ async def get_sales_summary(
             try:
                 amount_clean = amount_str.replace('￥', '').replace(',', '')
                 amount = float(amount_clean)
+                local_created_at = utc_timestamp_to_local_datetime(created_at)
+                if not local_created_at:
+                    continue
                 
                 # 检查是否在本月
-                if created_at >= month_start_str:
+                if local_created_at >= month_start:
                     month_sales += amount
                 
                 # 检查是否在本周
-                if created_at >= week_start_str:
+                if local_created_at >= week_start:
                     week_sales += amount
                 
                 # 检查是否在当日
-                if created_at >= today_start_str:
+                if local_created_at >= today_start:
                     today_sales += amount
             except (ValueError, TypeError):
                 continue
@@ -1435,6 +1456,8 @@ async def get_sales_summary(
             'message': '获取销售额摘要成功'
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取销售额摘要失败: {e}")
         return {

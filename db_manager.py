@@ -6950,6 +6950,115 @@ Cookie数量: {cookie_count}
                 logger.error(f"根据sid获取订单失败: sid={sid} - {e}")
                 return None
 
+    def find_recent_orders_by_match_context(self, sid: str = None, buyer_id: str = None, item_id: str = None,
+                                            cookie_id: str = None, statuses: List[str] = None,
+                                            exclude_order_id: str = None, minutes: int = 30, limit: int = 10):
+        """根据会话/买家/商品匹配键获取最近订单列表。
+
+        主要用于同一 sid 下短时间连续产生多个订单号时，做更稳妥的状态回填。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                conditions = []
+                params = []
+
+                if sid:
+                    sid_clean = sid.split('@')[0] if '@' in sid else sid
+                    conditions.append("(sid = ? OR sid = ? OR sid LIKE ?)")
+                    params.extend([sid, sid_clean, f"{sid_clean}@%"])
+
+                if buyer_id:
+                    conditions.append("buyer_id = ?")
+                    params.append(buyer_id)
+
+                if item_id:
+                    conditions.append("item_id = ?")
+                    params.append(item_id)
+
+                if cookie_id:
+                    conditions.append("cookie_id = ?")
+                    params.append(cookie_id)
+
+                if exclude_order_id:
+                    conditions.append("order_id != ?")
+                    params.append(exclude_order_id)
+
+                if statuses:
+                    normalized_statuses = []
+                    for status in statuses:
+                        normalized_status = self._normalize_order_status(status) or status
+                        if normalized_status not in normalized_statuses:
+                            normalized_statuses.append(normalized_status)
+
+                    if normalized_statuses:
+                        placeholders = ",".join(["?"] * len(normalized_statuses))
+                        conditions.append(f"order_status IN ({placeholders})")
+                        params.extend(normalized_statuses)
+
+                if not conditions:
+                    logger.warning("find_recent_orders_by_match_context 缺少有效查询条件，拒绝全表扫描")
+                    return []
+
+                conditions.append("datetime(COALESCE(updated_at, created_at)) >= datetime('now', ?)")
+                params.append(f'-{minutes} minutes')
+
+                sql = f'''
+                SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
+                       spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
+                FROM orders
+                WHERE {" AND ".join(conditions)}
+                ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, created_at DESC
+                LIMIT ?
+                '''
+                params.append(limit)
+
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                if not rows:
+                    logger.info(
+                        "根据匹配键未找到最近订单: "
+                        f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, "
+                        f"cookie_id={cookie_id}, statuses={statuses}, minutes={minutes}"
+                    )
+                    return []
+
+                logger.info(
+                    "根据匹配键找到最近订单: "
+                    f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, "
+                    f"count={len(rows)}, statuses={statuses}, minutes={minutes}"
+                )
+
+                orders = []
+                for row in rows:
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'spec_name': row[5],
+                        'spec_value': row[6],
+                        'spec_name_2': row[7],
+                        'spec_value_2': row[8],
+                        'quantity': row[9],
+                        'amount': row[10],
+                        'order_status': row[11],
+                        'cookie_id': row[12],
+                        'created_at': row[13],
+                        'updated_at': row[14],
+                    })
+
+                return orders
+
+            except Exception as e:
+                logger.error(
+                    "根据匹配键获取最近订单失败: "
+                    f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, error={e}"
+                )
+                return []
+
     def update_order_yifan_status(self, order_id: str, yifan_orderno: str = None,
                                   delivery_status: str = None, callback_data: str = None):
         """

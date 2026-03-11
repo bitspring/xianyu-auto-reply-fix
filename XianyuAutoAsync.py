@@ -22,6 +22,7 @@ from config import (
 import sys
 import aiohttp
 from collections import defaultdict
+from typing import Any, Dict, Optional
 from db_manager import db_manager
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
@@ -887,6 +888,9 @@ class XianyuLive:
         self.processed_message_ids_max_size = 10000  # 最大保存10000个消息ID，防止内存泄漏
         self.message_expire_time = 3600  # 消息过期时间（秒），默认1小时后可以重复回复
 
+        # 订单详情补抓任务：详情首次超时时，后台再补抓一次，避免整单丢失
+        self.order_detail_retry_tasks = {}
+
         # 初始化订单状态处理器
         self._init_order_status_handler()
 
@@ -953,6 +957,366 @@ class XianyuLive:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
         return task
+
+    def _sanitize_buyer_nick(self, candidate: Any, *, source: str = "unknown",
+                             message_meta: Dict[str, Any] = None, log_prefix: str = "") -> Optional[str]:
+        """过滤系统/营销文案，避免污染订单买家昵称。"""
+        if candidate is None:
+            return None
+
+        text = str(candidate).strip()
+        if not text or text in {"未知用户", "unknown", "unknown_user"}:
+            return None
+
+        invalid_exact_titles = {
+            "订单",
+            "全部",
+            "交易消息",
+            "等待你发货",
+            "你人真不错，送你闲鱼小红花",
+            "卖家人不错？送Ta闲鱼小红花",
+            "快给ta一个评价吧～",
+        }
+        if text in invalid_exact_titles:
+            logger.info(f"{log_prefix} 👤 忽略系统标题型买家昵称({source}): {text}")
+            return None
+
+        meta = message_meta if isinstance(message_meta, dict) else {}
+        related_notice_texts = []
+        for key in ("detailNotice", "reminderContent", "reminderNotice"):
+            value = str(meta.get(key, "")).strip()
+            if value:
+                related_notice_texts.append(value)
+
+        if text in related_notice_texts:
+            logger.info(f"{log_prefix} 👤 忽略通知文案型买家昵称({source}): {text}")
+            return None
+
+        reminder_title = str(meta.get("reminderTitle", "")).strip()
+        if source != "senderNick":
+            invalid_keywords = (
+                "小红花", "待付款", "待发货", "待刀成", "成功小刀", "闲鱼",
+                "交易", "收货", "退款", "评价", "发货", "付款", "拍下",
+                "确认", "关闭", "鼓励", "真不错", "全部", "订单",
+            )
+            if any(keyword in text for keyword in invalid_keywords):
+                logger.info(f"{log_prefix} 👤 忽略系统关键词型买家昵称({source}): {text}")
+                return None
+
+            if reminder_title == text and len(text) >= 10 and any(ch in text for ch in "，,。！？?!：:～~"):
+                logger.info(f"{log_prefix} 👤 忽略长句型买家昵称({source}): {text}")
+                return None
+
+        return text
+
+    def _resolve_delivery_log_buyer_nick(self, buyer_nick: Any = None, *, order_id: str = None,
+                                         buyer_id: str = None, log_prefix: str = "") -> Optional[str]:
+        """为发货日志优先选择可信的买家昵称，避免写入系统卡片标题。"""
+        from db_manager import db_manager
+
+        normalized_order_id = str(order_id).strip() if order_id else None
+        normalized_buyer_id = str(buyer_id).strip() if buyer_id else None
+
+        try:
+            if normalized_order_id:
+                order_info = db_manager.get_order_by_id(normalized_order_id)
+                if order_info:
+                    order_cookie_id = str(order_info.get("cookie_id") or "").strip()
+                    if not order_cookie_id or order_cookie_id == str(self.cookie_id).strip():
+                        order_buyer_nick = self._sanitize_buyer_nick(
+                            order_info.get("buyer_nick"),
+                            source="delivery_log_order",
+                            log_prefix=log_prefix,
+                        )
+                        if order_buyer_nick:
+                            return order_buyer_nick
+
+                    if not normalized_buyer_id:
+                        normalized_buyer_id = str(order_info.get("buyer_id") or "").strip() or None
+
+            if normalized_buyer_id:
+                recent_order = db_manager.get_recent_order_by_buyer_id(
+                    normalized_buyer_id,
+                    cookie_id=self.cookie_id,
+                    minutes=60,
+                )
+                if recent_order:
+                    recent_buyer_nick = self._sanitize_buyer_nick(
+                        recent_order.get("buyer_nick"),
+                        source="delivery_log_recent_order",
+                        log_prefix=log_prefix,
+                    )
+                    if recent_buyer_nick:
+                        return recent_buyer_nick
+        except Exception as resolve_error:
+            logger.warning(f"{log_prefix} 发货日志买家昵称解析失败: {self._safe_str(resolve_error)}")
+
+        return self._sanitize_buyer_nick(
+            buyer_nick,
+            source="delivery_log_raw",
+            log_prefix=log_prefix,
+        )
+
+    def _lookup_delivery_order_by_sid(self, sid: str, *, minutes: int = 10,
+                                      log_prefix: str = "") -> Dict[str, Any]:
+        """根据 sid 查找简化发货对应订单，并区分是否已处理/已关闭。"""
+        normalized_sid = str(sid or "").strip()
+        if not normalized_sid:
+            return {"match_type": "missing", "order": None}
+
+        try:
+            pending_orders = db_manager.find_recent_orders_by_match_context(
+                sid=normalized_sid,
+                cookie_id=self.cookie_id,
+                statuses=[
+                    "pending_ship",
+                    "pending_delivery",
+                    "partial_success",
+                    "partial_pending_finalize",
+                ],
+                minutes=minutes,
+                limit=5,
+            )
+        except Exception as lookup_error:
+            logger.error(f"{log_prefix} sid兜底查单异常: {self._safe_str(lookup_error)}")
+            return {"match_type": "error", "order": None}
+
+        if pending_orders:
+            order = pending_orders[0]
+            logger.info(
+                f"{log_prefix} sid兜底命中待发货订单: sid={normalized_sid}, "
+                f"order_id={order.get('order_id')}, status={order.get('order_status') or 'unknown'}"
+            )
+            return {"match_type": "pending_ship", "order": order}
+
+        try:
+            recent_orders = db_manager.find_recent_orders_by_match_context(
+                sid=normalized_sid,
+                cookie_id=self.cookie_id,
+                statuses=[
+                    "processing",
+                    "pending_payment",
+                    "shipped",
+                    "completed",
+                    "cancelled",
+                ],
+                minutes=minutes,
+                limit=5,
+            )
+        except Exception as lookup_error:
+            logger.error(f"{log_prefix} sid兜底查单异常: {self._safe_str(lookup_error)}")
+            return {"match_type": "error", "order": None}
+
+        if not recent_orders:
+            return {"match_type": "missing", "order": None}
+
+        order = recent_orders[0]
+        order_status = str(order.get("order_status") or "").strip()
+        if order_status in {"shipped", "completed"}:
+            match_type = "already_processed"
+        elif order_status == "cancelled":
+            match_type = "cancelled"
+        elif order_status in {"processing", "pending_payment"}:
+            match_type = "not_ready"
+        else:
+            match_type = "other_status"
+
+        logger.info(
+            f"{log_prefix} sid兜底命中订单: sid={normalized_sid}, "
+            f"order_id={order.get('order_id')}, status={order_status or 'unknown'}, match_type={match_type}"
+        )
+        return {"match_type": match_type, "order": order}
+
+    async def _ensure_item_owned_by_current_account(self, item_id: str, *,
+                                                    log_prefix: str = "",
+                                                    page_size: int = 50,
+                                                    max_pages: int = 3) -> bool:
+        """优先查本地缓存，未命中时刷新在售商品列表进行归属校验。"""
+        if not item_id or item_id == "未知商品":
+            return False
+
+        existing_item = db_manager.get_item_info(self.cookie_id, item_id)
+        if existing_item:
+            return True
+
+        logger.info(f"{log_prefix} 商品 {item_id} 未命中本地缓存，刷新在售商品列表后重试归属校验")
+        try:
+            for page_number in range(1, max_pages + 1):
+                result = await self.get_item_list_info(page_number=page_number, page_size=page_size)
+                if not result.get("success"):
+                    logger.warning(f"{log_prefix} 刷新在售商品列表失败，停止归属校验回退: page={page_number}, result={result}")
+                    break
+
+                current_items = result.get("items", [])
+                if any(str(item.get("id", "")).strip() == str(item_id).strip() for item in current_items):
+                    logger.info(f"{log_prefix} 商品 {item_id} 在第 {page_number} 页在售商品列表中命中，归属校验通过")
+                    return True
+
+                if len(current_items) < page_size:
+                    break
+        except Exception as e:
+            logger.error(f"{log_prefix} 刷新在售商品列表进行归属校验失败: {self._safe_str(e)}")
+
+        return bool(db_manager.get_item_info(self.cookie_id, item_id))
+
+    def _extract_order_message_context(self, message: dict, msg_id: str = None) -> Dict[str, Any]:
+        """从订单相关消息中提取买家、会话和商品信息。"""
+        buyer_id = "unknown_user"
+        buyer_nick = None
+        sid = ""
+        item_id = None
+        log_prefix = f"【{self.cookie_id}】[{msg_id}]" if msg_id else f"【{self.cookie_id}】"
+
+        try:
+            message_1 = message.get("1")
+            if isinstance(message_1, str) and '@' in message_1:
+                buyer_id = message_1.split('@')[0]
+            elif isinstance(message_1, dict):
+                if "10" in message_1 and isinstance(message_1["10"], dict):
+                    message_10 = message_1["10"]
+                    buyer_id = message_10.get("senderUserId", "unknown_user")
+                    buyer_nick = self._sanitize_buyer_nick(
+                        message_10.get("senderNick"),
+                        source="senderNick",
+                        message_meta=message_10,
+                        log_prefix=log_prefix
+                    )
+                    if not buyer_nick:
+                        reminder_title = message_10.get("reminderTitle", "")
+                        buyer_nick = self._sanitize_buyer_nick(
+                            reminder_title,
+                            source="reminderTitle",
+                            message_meta=message_10,
+                            log_prefix=log_prefix
+                        )
+                        if buyer_nick:
+                            logger.info(f"{log_prefix} 👤 从reminderTitle提取到买家昵称: {buyer_nick}")
+                    if buyer_nick:
+                        logger.info(f"{log_prefix} 👤 提取到买家昵称: {buyer_nick}")
+                sid = message_1.get("2", "")
+                if sid:
+                    logger.info(f"{log_prefix} 📌 提取到sid: {sid}")
+        except Exception as context_e:
+            logger.warning(f"{log_prefix} 提取订单上下文失败: {self._safe_str(context_e)}")
+
+        try:
+            if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                url_info = message["1"]["10"].get("reminderUrl", "")
+                if isinstance(url_info, str) and "itemId=" in url_info:
+                    item_id = url_info.split("itemId=")[1].split("&")[0]
+
+            if not item_id:
+                item_id = self.extract_item_id_from_message(message)
+        except Exception as item_e:
+            logger.warning(f"{log_prefix} 提取商品ID失败: {self._safe_str(item_e)}")
+
+        return {
+            'buyer_id': buyer_id,
+            'buyer_nick': buyer_nick,
+            'sid': sid,
+            'item_id': item_id,
+        }
+
+    def _preload_basic_order_info(self, order_id: str, item_id: str = None, buyer_id: str = None,
+                                  sid: str = None, buyer_nick: str = None) -> bool:
+        """在详情抓取前先落基础订单，避免详情超时导致整单丢失。"""
+        try:
+            existing_order = db_manager.get_order_by_id(order_id)
+            buyer_id_to_save = buyer_id
+            buyer_nick_to_save = self._sanitize_buyer_nick(
+                buyer_nick,
+                source="preload",
+                log_prefix=f"【{self.cookie_id}】"
+            )
+
+            if buyer_id and buyer_id == self.myid:
+                if existing_order:
+                    existing_buyer_id = (existing_order.get('buyer_id') or '').strip()
+                    existing_buyer_nick = existing_order.get('buyer_nick')
+                    buyer_id_to_save = existing_buyer_id if existing_buyer_id and existing_buyer_id != self.myid else None
+                    if existing_buyer_nick:
+                        buyer_nick_to_save = existing_buyer_nick
+                    logger.info(
+                        f"【{self.cookie_id}】基础订单命中自己买家ID保护，保留已有买家信息: "
+                        f"order_id={order_id}, preserved_buyer_id={buyer_id_to_save}"
+                    )
+                else:
+                    logger.info(
+                        f"【{self.cookie_id}】跳过疑似买家订单 {order_id} 的基础预入库，buyer_id={buyer_id} 等于自己的ID"
+                    )
+                    return False
+
+            success = db_manager.insert_or_update_order(
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id_to_save,
+                buyer_nick=buyer_nick_to_save,
+                sid=sid,
+                cookie_id=self.cookie_id,
+                order_status='processing' if not existing_order else None
+            )
+            if success:
+                action = "更新基础订单信息" if existing_order else "基础订单已预入库"
+                logger.info(
+                    f"【{self.cookie_id}】{action}: order_id={order_id}, item_id={item_id}, "
+                    f"buyer_id={buyer_id_to_save}, sid={sid or '-'}"
+                )
+            else:
+                logger.warning(f"【{self.cookie_id}】基础订单预入库失败: {order_id}")
+            return success
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】基础订单预入库异常: {self._safe_str(e)}")
+            return False
+
+    async def _retry_order_detail_after_delay(self, order_id: str, item_id: str = None, buyer_id: str = None,
+                                              sid: str = None, buyer_nick: str = None, delay_seconds: int = 30):
+        """订单详情首次抓取失败后，后台延迟补抓一次。"""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay_seconds)
+            logger.info(f"【{self.cookie_id}】开始延迟补抓订单详情: order_id={order_id}, delay={delay_seconds}s")
+            result = await self.fetch_order_detail_info(
+                order_id,
+                item_id,
+                buyer_id,
+                sid=sid,
+                buyer_nick=buyer_nick,
+                force_refresh=True
+            )
+            if result:
+                logger.info(f"【{self.cookie_id}】订单详情延迟补抓成功: {order_id}")
+            else:
+                logger.warning(f"【{self.cookie_id}】订单详情延迟补抓仍失败，保留基础订单: {order_id}")
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】订单详情延迟补抓任务已取消: {order_id}")
+            raise
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】订单详情延迟补抓异常: {order_id} - {self._safe_str(e)}")
+        finally:
+            existing_task = self.order_detail_retry_tasks.get(order_id)
+            if existing_task is current_task:
+                self.order_detail_retry_tasks.pop(order_id, None)
+
+    def _schedule_order_detail_retry(self, order_id: str, item_id: str = None, buyer_id: str = None,
+                                     sid: str = None, buyer_nick: str = None, delay_seconds: int = 30):
+        """调度订单详情补抓任务，避免同一订单重复创建补抓。"""
+        existing_task = self.order_detail_retry_tasks.get(order_id)
+        if existing_task and not existing_task.done():
+            logger.info(f"【{self.cookie_id}】订单详情补抓任务已存在，跳过重复调度: {order_id}")
+            return
+
+        task = self._create_tracked_task(
+            self._retry_order_detail_after_delay(
+                order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                sid=sid,
+                buyer_nick=buyer_nick,
+                delay_seconds=delay_seconds
+            )
+        )
+        self.order_detail_retry_tasks[order_id] = task
+        logger.info(f"【{self.cookie_id}】已调度订单详情补抓任务: order_id={order_id}, delay={delay_seconds}s")
 
     # ============ 高性能消息队列系统方法 ============
     
@@ -1444,13 +1808,20 @@ class XianyuLive:
         try:
             from db_manager import db_manager
             meta = rule_meta or {}
+            log_prefix = f"【{self.cookie_id}】"
+            resolved_buyer_nick = self._resolve_delivery_log_buyer_nick(
+                buyer_nick,
+                order_id=order_id,
+                buyer_id=buyer_id,
+                log_prefix=log_prefix,
+            )
             db_manager.create_delivery_log(
                 user_id=self.user_id,
                 cookie_id=self.cookie_id,
                 order_id=order_id,
                 item_id=item_id,
                 buyer_id=buyer_id,
-                buyer_nick=buyer_nick,
+                buyer_nick=resolved_buyer_nick,
                 rule_id=meta.get('rule_id'),
                 rule_keyword=meta.get('rule_keyword'),
                 card_type=meta.get('card_type'),
@@ -2064,9 +2435,10 @@ class XianyuLive:
             # 检查商品是否属于当前账号
             if item_id and item_id != "未知商品":
                 try:
-                    from db_manager import db_manager
-                    item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                    if not item_info:
+                    if not await self._ensure_item_owned_by_current_account(
+                        item_id,
+                        log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}]'
+                    ):
                         logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
                         self._record_delivery_log(
                             order_id=order_id,
@@ -2408,8 +2780,10 @@ class XianyuLive:
             # 检查商品是否属于当前cookies
             if item_id and item_id != "未知商品":
                 try:
-                    item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                    if not item_info:
+                    if not await self._ensure_item_owned_by_current_account(
+                        item_id,
+                        log_prefix=f'[{msg_time}] 【{self.cookie_id}】'
+                    ):
                         logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
                         self._record_delivery_log(
                             item_id=item_id,
@@ -2458,17 +2832,19 @@ class XianyuLive:
 
                 if fallback_sid:
                     try:
-                        recent_order = db_manager.get_recent_order_by_sid(
-                            sid=fallback_sid,
-                            cookie_id=self.cookie_id,
-                            status='pending_ship',
-                            minutes=10
+                        sid_lookup = self._lookup_delivery_order_by_sid(
+                            fallback_sid,
+                            minutes=10,
+                            log_prefix=f'[{msg_time}] 【{self.cookie_id}】'
                         )
                     except Exception as sid_query_e:
                         logger.error(f'[{msg_time}] 【{self.cookie_id}】sid兜底查单异常: {self._safe_str(sid_query_e)}')
-                        recent_order = None
+                        sid_lookup = {'match_type': 'error', 'order': None}
 
-                    if recent_order:
+                    recent_order = sid_lookup.get('order')
+                    sid_match_type = sid_lookup.get('match_type', 'missing')
+
+                    if recent_order and sid_match_type == 'pending_ship':
                         fallback_order_id = recent_order.get('order_id')
                         fallback_item_id = recent_order.get('item_id')
                         fallback_buyer_id = recent_order.get('buyer_id')
@@ -2497,6 +2873,25 @@ class XianyuLive:
                             f'[{msg_time}] 【{self.cookie_id}】✅ 订单ID提取失败，已通过sid兜底定位订单: '
                             f'sid={fallback_sid}, order_id={order_id}, item_id={item_id}'
                         )
+                    elif recent_order:
+                        fallback_order_id = recent_order.get('order_id')
+                        fallback_status = recent_order.get('order_status') or 'unknown'
+                        if sid_match_type == 'already_processed':
+                            logger.info(
+                                f'[{msg_time}] 【{self.cookie_id}】ℹ️ 订单ID提取失败，但sid命中的订单已处理完成，跳过重复发货: '
+                                f'sid={fallback_sid}, order_id={fallback_order_id}, status={fallback_status}'
+                            )
+                        elif sid_match_type == 'cancelled':
+                            logger.info(
+                                f'[{msg_time}] 【{self.cookie_id}】ℹ️ 订单ID提取失败，但sid命中的订单已关闭，跳过自动发货: '
+                                f'sid={fallback_sid}, order_id={fallback_order_id}'
+                            )
+                        else:
+                            logger.info(
+                                f'[{msg_time}] 【{self.cookie_id}】ℹ️ 订单ID提取失败，但sid命中的订单当前状态不适合兜底发货，等待后续完整消息: '
+                                f'sid={fallback_sid}, order_id={fallback_order_id}, status={fallback_status}'
+                            )
+                        return
                     else:
                         logger.warning(
                             f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，sid兜底也未命中待发货订单，跳过自动发货 '
@@ -6290,6 +6685,13 @@ Cookie数量: {cookie_count}
                 )
 
                 if result:
+                    retry_task = self.order_detail_retry_tasks.get(order_id)
+                    current_task = asyncio.current_task()
+                    if retry_task and retry_task is not current_task and not retry_task.done():
+                        retry_task.cancel()
+                        self.order_detail_retry_tasks.pop(order_id, None)
+                        logger.info(f"【{self.cookie_id}】订单详情已成功获取，取消待执行的补抓任务: {order_id}")
+
                     logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
                     logger.info(f"【{self.cookie_id}】页面标题: {result.get('title', '未知')}")
 
@@ -6345,7 +6747,11 @@ Cookie数量: {cookie_count}
                         normalized_current_order_status = db_manager._normalize_order_status(current_order_status)
                         normalized_incoming_order_status = db_manager._normalize_order_status(order_status)
                         buyer_id_to_save = buyer_id
-                        buyer_nick_to_save = buyer_nick
+                        buyer_nick_to_save = self._sanitize_buyer_nick(
+                            buyer_nick,
+                            source="order_detail",
+                            log_prefix=f"【{self.cookie_id}】"
+                        )
                         order_status_to_save = self._resolve_external_order_status(
                             current_order_status,
                             order_status,
@@ -6453,6 +6859,9 @@ Cookie数量: {cookie_count}
                              data_preview_index: int = 0, delivery_unit_index: int = 1):
         """自动发货功能 - 匹配规则并准备发货内容，不直接提交副作用。"""
         try:
+            matched_rule_context = None
+            match_mode_context = None
+
             def build_result(success: bool, content: str = None, error: str = None, matched_rule: dict = None,
                              match_mode_value: str = None, delivery_steps_value: list = None):
                 order_spec_mode_value = 'no_spec'
@@ -6679,6 +7088,7 @@ Cookie数量: {cookie_count}
             delivery_rules = []
             if order_spec_mode == 'two_spec':
                 match_mode = 'two_spec_exact'
+                match_mode_context = match_mode
                 logger.info(
                     f"尝试精确匹配两组规格发货规则: {search_text[:50]}... "
                     f"[{spec_name}:{spec_value}, {spec_name_2}:{spec_value_2}]"
@@ -6698,6 +7108,7 @@ Cookie数量: {cookie_count}
                     return build_result(False, error=error_message, match_mode_value='blocked_no_rule')
             elif order_spec_mode == 'one_spec':
                 match_mode = 'one_spec_exact'
+                match_mode_context = match_mode
                 logger.info(
                     f"尝试精确匹配一组规格发货规则: {search_text[:50]}... "
                     f"[{spec_name}:{spec_value}]"
@@ -6734,12 +7145,14 @@ Cookie数量: {cookie_count}
                         return build_result(False, error=block_reason, match_mode_value='blocked_multiple_no_spec_rules')
                     delivery_rules = fallback_rules
                     match_mode = 'one_spec_fallback_no_spec'
+                    match_mode_context = match_mode
                     logger.warning(
                         f"一组规格订单已降级命中唯一普通规则: order_id={order_id or 'unknown'}, "
                         f"item_id={item_id or 'unknown'}, rule_id={delivery_rules[0].get('id')}"
                     )
             else:
                 match_mode = 'no_spec_match'
+                match_mode_context = match_mode
                 logger.info(f"无规格订单，尝试匹配普通发货规则: {search_text[:50]}...")
                 delivery_rules = db_manager.get_delivery_rules_by_keyword(
                     search_text,
@@ -6760,6 +7173,7 @@ Cookie数量: {cookie_count}
 
             # 使用第一个匹配的规则（按关键字长度降序排列，优先匹配更精确的规则）
             rule = delivery_rules[0]
+            matched_rule_context = rule
             rule_spec_mode = _get_rule_spec_mode(rule)
 
             logger.info(
@@ -6955,8 +7369,20 @@ Cookie数量: {cookie_count}
                 return build_result(False, error="未检测到订单ID，跳过发货内容处理", matched_rule=rule, match_mode_value=match_mode)
 
         except Exception as e:
-            logger.error(f"自动发货失败: {self._safe_str(e)}")
-            return build_result(False, error=f"自动发货异常: {self._safe_str(e)}")
+            error_text = self._safe_str(e)
+            if matched_rule_context:
+                rule_label = matched_rule_context.get('keyword') or f"规则ID={matched_rule_context.get('id')}"
+                card_type = matched_rule_context.get('card_type') or 'unknown'
+                error_message = f"规则已命中({rule_label})，但{card_type}发货处理异常: {error_text}"
+            else:
+                error_message = f"自动发货异常: {error_text}"
+            logger.error(error_message)
+            return build_result(
+                False,
+                error=error_message,
+                matched_rule=matched_rule_context,
+                match_mode_value=match_mode_context
+            )
 
 
 
@@ -7157,7 +7583,7 @@ Cookie数量: {cookie_count}
 
                 return None
 
-        except (aiohttp.ClientTimeout, aiohttp.ClientError) as e:
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             logger.warning(f"API调用网络异常: {self._safe_str(e)}")
 
             # 网络异常也进行重试
@@ -9976,36 +10402,16 @@ Cookie数量: {cookie_count}
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 检测到订单ID: {order_id}，开始获取订单详情')
 
-                    temp_user_id = None
-                    temp_item_id = None
-                    temp_sid = None
+                    order_context = self._extract_order_message_context(message, msg_id=msg_id)
+                    temp_user_id = order_context.get('buyer_id')
+                    temp_item_id = order_context.get('item_id')
+                    temp_sid = order_context.get('sid')
+                    temp_buyer_nick = order_context.get('buyer_nick')
 
                     # 通知订单状态处理器订单ID已提取
                     if self.order_status_handler:
                         logger.info(f"【{self.cookie_id}】准备调用订单状态处理器.on_order_id_extracted: {order_id}")
                         try:
-                            try:
-                                message_1 = message.get("1")
-                                if isinstance(message_1, str) and '@' in message_1:
-                                    temp_user_id = message_1.split('@')[0]
-                                elif isinstance(message_1, dict):
-                                    if "10" in message_1 and isinstance(message_1["10"], dict):
-                                        temp_user_id = message_1["10"].get("senderUserId", "unknown_user")
-                                    temp_sid = message_1.get("2", "")
-                            except Exception as context_extract_e:
-                                logger.warning(f"【{self.cookie_id}】[{msg_id}] 提取订单状态严格匹配上下文失败: {self._safe_str(context_extract_e)}")
-
-                            try:
-                                if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
-                                    url_info = message["1"]["10"].get("reminderUrl", "")
-                                    if isinstance(url_info, str) and "itemId=" in url_info:
-                                        temp_item_id = url_info.split("itemId=")[1].split("&")[0]
-
-                                if not temp_item_id:
-                                    temp_item_id = self.extract_item_id_from_message(message)
-                            except Exception as item_context_e:
-                                logger.warning(f"【{self.cookie_id}】[{msg_id}] 提取订单状态商品匹配上下文失败: {self._safe_str(item_context_e)}")
-
                             self.order_status_handler.on_order_id_extracted(
                                 order_id,
                                 self.cookie_id,
@@ -10024,73 +10430,43 @@ Cookie数量: {cookie_count}
                     else:
                         logger.warning(f"【{self.cookie_id}】订单状态处理器为None，跳过订单ID提取通知: {order_id}")
 
+                    basic_order_saved = self._preload_basic_order_info(
+                        order_id,
+                        item_id=temp_item_id,
+                        buyer_id=temp_user_id,
+                        sid=temp_sid,
+                        buyer_nick=temp_buyer_nick
+                    )
+
                     # 立即获取订单详情信息
                     try:
-                        # 先尝试提取用户ID、商品ID和买家昵称用于订单详情获取
-                        temp_buyer_nick = None  # 买家昵称
-
-                        # 提取用户ID和买家昵称
-                        try:
-                            message_1 = message.get("1")
-                            if isinstance(message_1, str) and '@' in message_1:
-                                temp_user_id = message_1.split('@')[0]
-                            elif isinstance(message_1, dict):
-                                # 从字典中提取用户ID和买家昵称
-                                if "10" in message_1 and isinstance(message_1["10"], dict):
-                                    message_10 = message_1["10"]
-                                    temp_user_id = message_10.get("senderUserId", "unknown_user")
-                                    # 提取买家昵称：优先使用senderNick，如果为空则尝试使用reminderTitle（需过滤系统提示）
-                                    temp_buyer_nick = message_10.get("senderNick")
-                                    if not temp_buyer_nick:
-                                        # senderNick为空，尝试使用reminderTitle作为备选
-                                        reminder_title = message_10.get("reminderTitle", "")
-                                        if reminder_title:
-                                            # 系统提示文本关键词列表（这些不是买家昵称）
-                                            system_keywords = ['待付款', '待发货', '已付款', '发货', '收货', '退款', '交易', '拍下', '付款', '确认', '成功', '关闭', '评价', '完成']
-                                            is_system_text = any(keyword in reminder_title for keyword in system_keywords)
-                                            if not is_system_text:
-                                                temp_buyer_nick = reminder_title
-                                                logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 从reminderTitle提取到买家昵称: {temp_buyer_nick}")
-                                    if temp_buyer_nick:
-                                        logger.info(f"【{self.cookie_id}】[{msg_id}] 👤 提取到买家昵称: {temp_buyer_nick}")
-                                else:
-                                    temp_user_id = "unknown_user"
-                        except Exception:
-                            temp_user_id = "unknown_user"
-
-                        # 提取sid（会话ID）用于简化消息匹配订单
-                        # 完整消息结构: {'1': {'1': {...}, '2': '56226853668@goofish', ...}}
-                        # sid在message['1']['2']中
-                        try:
-                            message_1 = message.get("1")
-                            if isinstance(message_1, dict):
-                                temp_sid = message_1.get("2", "")
-                                if temp_sid:
-                                    logger.info(f"【{self.cookie_id}】[{msg_id}] 📌 提取到sid: {temp_sid}")
-                        except Exception as sid_e:
-                            logger.warning(f"【{self.cookie_id}】[{msg_id}] 提取sid失败: {self._safe_str(sid_e)}")
-
-                        # 提取商品ID
-                        try:
-                            if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
-                                url_info = message["1"]["10"].get("reminderUrl", "")
-                                if isinstance(url_info, str) and "itemId=" in url_info:
-                                    temp_item_id = url_info.split("itemId=")[1].split("&")[0]
-
-                            if not temp_item_id:
-                                temp_item_id = self.extract_item_id_from_message(message)
-                        except Exception:
-                            pass
-
                         # 调用订单详情获取方法（传入sid和buyer_nick用于保存到数据库）
                         order_detail = await self.fetch_order_detail_info(order_id, temp_item_id, temp_user_id, sid=temp_sid, buyer_nick=temp_buyer_nick)
                         if order_detail:
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 订单详情获取成功: {order_id}')
                         else:
                             logger.warning(f'[{msg_time}] 【{self.cookie_id}】⚠️ 订单详情获取失败: {order_id}')
+                            if basic_order_saved:
+                                self._schedule_order_detail_retry(
+                                    order_id,
+                                    item_id=temp_item_id,
+                                    buyer_id=temp_user_id,
+                                    sid=temp_sid,
+                                    buyer_nick=temp_buyer_nick,
+                                    delay_seconds=30
+                                )
 
                     except Exception as detail_e:
                         logger.error(f'[{msg_time}] 【{self.cookie_id}】❌ 获取订单详情异常: {self._safe_str(detail_e)}')
+                        if basic_order_saved:
+                            self._schedule_order_detail_retry(
+                                order_id,
+                                item_id=temp_item_id,
+                                buyer_id=temp_user_id,
+                                sid=temp_sid,
+                                buyer_nick=temp_buyer_nick,
+                                delay_seconds=30
+                            )
                 else:
                     logger.warning(f"【{self.cookie_id}】[{msg_id}] 未检测到订单ID")
             except Exception as e:
@@ -10197,16 +10573,15 @@ Cookie数量: {cookie_count}
                             
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 🔍 简化消息解析: sid={simple_sid}, session_id={session_id_str}')
                             
-                            # 根据sid从数据库查找最近的订单信息（不再使用buyer_id）
-                            from db_manager import db_manager
-                            recent_order = db_manager.get_recent_order_by_sid(
-                                sid=simple_sid,
-                                cookie_id=self.cookie_id,
-                                status='pending_ship',  # 只查找已付款待发货状态的订单
-                                minutes=10  # 最近10分钟内的订单
+                            sid_lookup = self._lookup_delivery_order_by_sid(
+                                simple_sid,
+                                minutes=10,
+                                log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}]'
                             )
+                            recent_order = sid_lookup.get('order')
+                            sid_match_type = sid_lookup.get('match_type', 'missing')
                             
-                            if recent_order:
+                            if recent_order and sid_match_type == 'pending_ship':
                                 order_id = recent_order.get('order_id')
                                 real_item_id = recent_order.get('item_id')
                                 simple_user_id = recent_order.get('buyer_id', user_id)  # 从订单中获取buyer_id
@@ -10238,6 +10613,28 @@ Cookie数量: {cookie_count}
                                     msg_id=msg_id
                                 )
                                 logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（简化消息自动发货）")
+                                return
+                            elif recent_order:
+                                order_id = recent_order.get('order_id')
+                                order_status = recent_order.get('order_status') or 'unknown'
+                                if sid_match_type == 'already_processed':
+                                    logger.info(
+                                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ℹ️ sid命中的订单已处理完成，跳过重复发货: '
+                                        f'order_id={order_id}, status={order_status}'
+                                    )
+                                    logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（订单已处理）")
+                                elif sid_match_type == 'cancelled':
+                                    logger.info(
+                                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ℹ️ sid命中的订单已关闭，跳过自动发货: '
+                                        f'order_id={order_id}'
+                                    )
+                                    logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（订单已关闭）")
+                                else:
+                                    logger.info(
+                                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ℹ️ sid命中的订单当前状态不适合简化消息兜底发货，等待后续完整消息: '
+                                        f'order_id={order_id}, status={order_status}'
+                                    )
+                                    logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（订单状态未就绪）")
                                 return
                             else:
                                 logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 未找到sid {simple_sid} 的最近订单，跳过自动发货')
@@ -10737,9 +11134,10 @@ Cookie数量: {cookie_count}
                         # 检查商品是否属于当前cookies
                         if item_id and item_id != "未知商品":
                             try:
-                                from db_manager import db_manager
-                                item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                                if not item_info:
+                                if not await self._ensure_item_owned_by_current_account(
+                                    item_id,
+                                    log_prefix=f'[{msg_time}] 【{self.cookie_id}】'
+                                ):
                                     logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过免拼发货')
                                     return
                                 logger.warning(f'[{msg_time}] 【{self.cookie_id}】✅ 商品 {item_id} 归属验证通过')
@@ -10793,13 +11191,16 @@ Cookie数量: {cookie_count}
             # 自动更新买家昵称（补全历史订单的昵称信息）
             # 需要过滤掉系统提示文本，避免将"买家已拍下，待付款"等写入昵称
             if send_user_id and send_user_name:
-                # 检查是否为系统提示文本
-                system_keywords = ['待付款', '待发货', '已付款', '发货', '收货', '退款', '交易', '拍下', '付款', '确认', '成功', '关闭', '评价', '完成', '给ta']
-                is_system_text = any(keyword in send_user_name for keyword in system_keywords)
-                if not is_system_text:
+                valid_buyer_nick = self._sanitize_buyer_nick(
+                    send_user_name,
+                    source="message_sender",
+                    message_meta=message_10 if isinstance(message_10, dict) else None,
+                    log_prefix=f"【{self.cookie_id}】[{msg_id}]"
+                )
+                if valid_buyer_nick:
                     try:
                         from db_manager import db_manager
-                        db_manager.update_buyer_nick_by_buyer_id(send_user_id, send_user_name, self.cookie_id)
+                        db_manager.update_buyer_nick_by_buyer_id(send_user_id, valid_buyer_nick, self.cookie_id)
                     except Exception as e:
                         logger.debug(f"更新买家昵称失败: {self._safe_str(e)}")
 
