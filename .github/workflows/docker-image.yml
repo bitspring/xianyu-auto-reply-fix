@@ -21,6 +21,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 创建必要的挂载目录（防止启动时目录不存在导致权限问题）
+      - name: Create directories for volumes
+        run: mkdir -p data logs backups
+
       # 登录到 Docker Hub（仅在非 PR 事件时执行）
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
@@ -29,20 +33,39 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 构建并推送镜像
+      # 构建并推送镜像（仅在 main 分支且非 PR 时执行）
       - name: Build and push Docker image
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile-cn                # 使用你的 Dockerfile
-          push: true                          # 推送到仓库
+          file: Dockerfile-cn
+          push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # （可选）使用 docker-compose 启动服务进行测试，但不会影响推送
+      # 使用 Docker Compose 启动服务进行测试
       - name: Start services with Docker Compose
-        run: docker-compose up -d --build
+        run: docker compose up -d --build
+
+      # 等待健康检查通过（利用容器定义的 healthcheck）
+      - name: Wait for health check
+        run: |
+          timeout 60s bash -c 'until docker inspect --format="{{json .State.Health.Status}}" xianyu-auto-reply-fixed 2>/dev/null | grep -q "healthy"; do sleep 5; done'
+
+      # 可选：测试 API 端点
+      - name: Test health endpoint
+        run: curl -f http://localhost:8000/health
+
+      # 如果失败，输出容器日志
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+
+      # 清理容器和卷
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
