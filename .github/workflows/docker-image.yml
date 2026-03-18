@@ -1,4 +1,4 @@
-name: Docker Compose CI
+name: Docker Image CI
 
 on:
   push:
@@ -12,7 +12,7 @@ env:
   IMAGE_NAME: dragon5018/xianyu-auto-reply   # 替换为你的 Docker Hub 用户名/仓库名
 
 jobs:
-  build-and-push:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,10 +20,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # 创建必要的挂载目录（防止启动时目录不存在导致权限问题）
-      - name: Create directories for volumes
-        run: mkdir -p data logs backups
 
       # 登录到 Docker Hub（仅在非 PR 事件时执行）
       - name: Log in to Docker Hub
@@ -33,7 +29,50 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 构建并推送镜像（仅在 main 分支且非 PR 时执行）
+      # 构建 Docker 镜像（使用 build-push-action，但不推送）
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile-cn
+          load: true  # 将镜像加载到本地 docker 守护进程
+          tags: ${{ env.IMAGE_NAME }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 使用构建的镜像启动容器进行测试
+      - name: Run test container
+        run: |
+          docker run -d --name test-container \
+            -p 8000:8090 \
+            -e PYTHONUNBUFFERED=1 \
+            -e DB_PATH=/app/data/test.db \
+            -e LOG_LEVEL=INFO \
+            ${{ env.IMAGE_NAME }}:test
+
+      # 等待容器健康（使用内置健康检查或自定义循环）
+      - name: Wait for container to be ready
+        run: |
+          timeout 90s bash -c '
+            until docker inspect --format="{{json .State.Health.Status}}" test-container 2>/dev/null | grep -q "healthy"; do
+              echo "Waiting for container to be healthy..."
+              sleep 3
+            done
+          ' || (docker logs test-container && exit 1)
+
+      # 测试 API 端点（通过映射的端口）
+      - name: Test health endpoint
+        run: |
+          curl -f --retry 5 --retry-delay 3 --retry-connrefused http://localhost:8000/health
+
+      # （可选）测试其他功能...
+
+      # 清理测试容器
+      - name: Clean up test container
+        if: always()
+        run: docker rm -f test-container
+
+      # 构建并推送最终镜像（仅在 main 分支且非 PR 时执行）
       - name: Build and push Docker image
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
@@ -47,25 +86,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 使用 Docker Compose 启动服务进行测试
-      - name: Start services with Docker Compose
-        run: docker compose up -d --build
-
-      # 等待健康检查通过（利用容器定义的 healthcheck）
-      - name: Wait for health check
-        run: |
-          timeout 60s bash -c 'until docker inspect --format="{{json .State.Health.Status}}" xianyu-auto-reply-fixed 2>/dev/null | grep -q "healthy"; do sleep 5; done'
-
-      # 可选：测试 API 端点
-      - name: Test health endpoint
-        run: curl -f http://localhost:8000/health
-
-      # 如果失败，输出容器日志
+      # 失败时输出容器日志
       - name: Show logs on failure
         if: failure()
-        run: docker compose logs
-
-      # 清理容器和卷
-      - name: Stop services
-        if: always()
-        run: docker compose down -v
+        run: docker logs test-container
