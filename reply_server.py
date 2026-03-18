@@ -12,10 +12,12 @@ import time
 import json
 import os
 import re
+from datetime import timedelta
 import uvicorn
 import pandas as pd
 import io
 import asyncio
+import queue
 from collections import defaultdict
 
 import cookie_manager
@@ -25,6 +27,14 @@ from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.time_utils import (
+    get_local_now,
+    local_date_to_utc_end_exclusive,
+    local_date_to_utc_start,
+    utc_timestamp_to_local_date_string,
+    utc_timestamp_to_local_datetime,
+)
+from order_event_hub import order_event_hub, publish_order_update_event
 
 from loguru import logger
 
@@ -79,6 +89,56 @@ BRUTE_FORCE_CONFIG = {
     'max_response_delay': 10,       # 最大响应延迟（秒）
     'captcha_require_failures': 2,  # 失败多少次后需要验证码
 }
+
+SENSITIVE_FIELD_PATTERNS = [
+    re.compile(r'((?:api[_-]?key|secret|token|cookie|password|proxy_pass)\s*[=:]\s*)([^\s,;]+)', re.IGNORECASE),
+    re.compile(r'([?&](?:api[_-]?key|secret|token|cookie|password|proxy_pass)=)([^&\s]+)', re.IGNORECASE),
+]
+
+
+def mask_sensitive_text(text: Any) -> str:
+    raw_text = str(text or '')
+    masked_text = raw_text
+
+    def _mask_match(match):
+        prefix = match.group(1)
+        secret = match.group(2)
+        if len(secret) <= 8:
+            masked = '***'
+        else:
+            masked = f"{secret[:3]}***{secret[-2:]}"
+        return f"{prefix}{masked}"
+
+    for pattern in SENSITIVE_FIELD_PATTERNS:
+        masked_text = pattern.sub(_mask_match, masked_text)
+
+    return masked_text
+
+
+def mask_cookie_value(cookie_value: str) -> str:
+    cookie_value = str(cookie_value or '')
+    if not cookie_value:
+        return ''
+    if len(cookie_value) <= 16:
+        return '***'
+    return f"{cookie_value[:8]}...{cookie_value[-8:]}"
+
+
+def mask_secret_value(secret_value: str) -> str:
+    secret_value = str(secret_value or '')
+    if not secret_value:
+        return ''
+    if len(secret_value) <= 8:
+        return '***'
+    return f"{secret_value[:2]}***{secret_value[-2:]}"
+
+
+def safe_client_error(message: str = '操作失败，请稍后重试') -> str:
+    return message
+
+
+def format_sse_event(event_name: str, data: Dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def cleanup_login_trackers():
@@ -383,7 +443,7 @@ def get_ip_failure_count(client_ip: str) -> int:
 
 
 # 账号密码登录会话管理
-password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
@@ -642,9 +702,9 @@ class ResponseModel(BaseModel):
 
 
 app = FastAPI(
-    title="Xianyu Auto Reply API",
+    title="Xianyu Management API",
     version="1.0.0",
-    description="闲鱼自动回复系统API",
+    description="闲鱼管理系统API",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -1188,6 +1248,225 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
     return {"message": "已登出"}
 
 
+# 销售额数据查询接口
+@app.get('/api/sales')
+async def get_sales_data(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_info: Optional[Dict[str, Any]] = Depends(verify_token)
+):
+    """
+    获取销售额数据
+    - start_date: 开始日期 (格式: YYYY-MM-DD)
+    - end_date: 结束日期 (格式: YYYY-MM-DD)
+    """
+    try:
+        from db_manager import db_manager
+
+        current_user_id = (user_info or {}).get('user_id')
+        if current_user_id is None:
+            raise HTTPException(status_code=401, detail='未登录或登录已过期')
+
+        user_cookies = db_manager.get_all_cookies(current_user_id)
+        cookie_ids = list(user_cookies.keys())
+        if not cookie_ids:
+            return {
+                'success': True,
+                'data': {
+                    'sales': [],
+                    'total': 0.0,
+                    'count': 0
+                },
+                'message': '获取销售额数据成功'
+            }
+        
+        # 构建查询
+        placeholders = ','.join(['?'] * len(cookie_ids))
+        query = f"SELECT amount, created_at FROM orders WHERE cookie_id IN ({placeholders})"
+        params = list(cookie_ids)
+        
+        if start_date:
+            utc_start = local_date_to_utc_start(start_date)
+            if not utc_start:
+                raise HTTPException(status_code=400, detail='开始日期格式错误，应为 YYYY-MM-DD')
+            query += " AND created_at >= ?"
+            params.append(utc_start)
+        if end_date:
+            utc_end_exclusive = local_date_to_utc_end_exclusive(end_date)
+            if not utc_end_exclusive:
+                raise HTTPException(status_code=400, detail='结束日期格式错误，应为 YYYY-MM-DD')
+            query += " AND created_at < ?"
+            params.append(utc_end_exclusive)
+        
+        # 执行查询
+        orders = db_manager.execute_query(query, params)
+        
+        # 处理数据
+        sales_by_date = {}
+        total_sales = 0.0
+        valid_count = 0
+        
+        for order in orders:
+            amount_str = order[0]
+            created_at = order[1]
+            
+            # 解析金额
+            try:
+                # 移除货币符号和逗号
+                amount_clean = amount_str.replace('￥', '').replace(',', '')
+                amount = float(amount_clean)
+                local_date = utc_timestamp_to_local_date_string(created_at)
+                if not local_date:
+                    continue
+
+                total_sales += amount
+                valid_count += 1
+                
+                # 直接按日期分组
+                if local_date not in sales_by_date:
+                    sales_by_date[local_date] = 0
+                sales_by_date[local_date] += amount
+            except (ValueError, TypeError):
+                # 跳过无效金额
+                continue
+        
+        # 转换为列表格式
+        formatted_data = [
+            {
+                'date': date,
+                'amount': round(amount, 2)
+            }
+            for date, amount in sorted(sales_by_date.items())
+        ]
+        
+        return {
+            'success': True,
+            'data': {
+                'sales': formatted_data,
+                'total': round(total_sales, 2),
+                'count': valid_count
+            },
+            'message': '获取销售额数据成功'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取销售额数据失败: {e}")
+        return {
+            'success': False,
+            'data': None,
+            'message': f'获取销售额数据失败: {str(e)}'
+        }
+
+
+# 周销售额和月销售额查询接口
+@app.get('/api/sales/summary')
+async def get_sales_summary(
+    user_info: Optional[Dict[str, Any]] = Depends(verify_token)
+):
+    """
+    获取当日、本周和本月销售额摘要
+    """
+    try:
+        from db_manager import db_manager
+
+        current_user_id = (user_info or {}).get('user_id')
+        if current_user_id is None:
+            raise HTTPException(status_code=401, detail='未登录或登录已过期')
+
+        user_cookies = db_manager.get_all_cookies(current_user_id)
+        cookie_ids = list(user_cookies.keys())
+        if not cookie_ids:
+            now = get_local_now()
+            return {
+                'success': True,
+                'data': {
+                    'today_sales': 0.0,
+                    'week_sales': 0.0,
+                    'month_sales': 0.0,
+                    'update_time': now.strftime('%Y-%m-%d %H:%M:%S')
+                },
+                'message': '获取销售额摘要成功'
+            }
+        
+        # 计算时间范围
+        now = get_local_now()
+        
+        # 当日开始
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_str = today_start.strftime('%Y-%m-%d')
+        
+        # 本周开始（周一）
+        week_start = today_start - timedelta(days=today_start.weekday())
+        week_start_str = week_start.strftime('%Y-%m-%d')
+        
+        # 本月开始
+        month_start = today_start.replace(day=1)
+        month_start_str = month_start.strftime('%Y-%m-%d')
+        
+        # 单次查询获取所有数据，减少数据库访问
+        placeholders = ','.join(['?'] * len(cookie_ids))
+        month_start_utc = local_date_to_utc_start(month_start_str)
+        query = f"SELECT amount, created_at FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
+        all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
+        
+        # 计算销售额
+        today_sales = 0.0
+        week_sales = 0.0
+        month_sales = 0.0
+        
+        for order in all_orders:
+            amount_str = order[0]
+            created_at = order[1]
+            
+            try:
+                amount_clean = amount_str.replace('￥', '').replace(',', '')
+                amount = float(amount_clean)
+                local_created_at = utc_timestamp_to_local_datetime(created_at)
+                if not local_created_at:
+                    continue
+                
+                # 检查是否在本月
+                if local_created_at >= month_start:
+                    month_sales += amount
+                
+                # 检查是否在本周
+                if local_created_at >= week_start:
+                    week_sales += amount
+                
+                # 检查是否在当日
+                if local_created_at >= today_start:
+                    today_sales += amount
+            except (ValueError, TypeError):
+                continue
+        
+        today_sales = round(today_sales, 2)
+        week_sales = round(week_sales, 2)
+        month_sales = round(month_sales, 2)
+        
+        return {
+            'success': True,
+            'data': {
+                'today_sales': today_sales,
+                'week_sales': week_sales,
+                'month_sales': month_sales,
+                'update_time': now.strftime('%Y-%m-%d %H:%M:%S')
+            },
+            'message': '获取销售额摘要成功'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取销售额摘要失败: {e}")
+        return {
+            'success': False,
+            'data': None,
+            'message': f'获取销售额摘要失败: {str(e)}'
+        }
+
+
 # ========================= 防暴力破解管理API =========================
 
 @app.get('/admin/security/login-stats')
@@ -1609,7 +1888,7 @@ async def send_message_api(request: SendMessageRequest):
 
         # 验证API秘钥
         if not verify_api_key(cleaned_api_key):
-            logger.warning(f"API秘钥验证失败: {cleaned_api_key}")
+            logger.warning(f"API秘钥验证失败: {mask_sensitive_text(cleaned_api_key)}")
             return SendMessageResponse(
                 success=False,
                 message="API秘钥验证失败"
@@ -1678,10 +1957,10 @@ async def send_message_api(request: SendMessageRequest):
         # 使用清理后的参数记录日志
         cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
         to_user_id_for_log = clean_param(request.to_user_id) if 'clean_param' in locals() else request.to_user_id
-        logger.error(f"API发送消息异常: {cookie_id_for_log} -> {to_user_id_for_log}, 错误: {str(e)}")
+        logger.error(f"API发送消息异常: {cookie_id_for_log} -> {to_user_id_for_log}, 错误: {mask_sensitive_text(e)}")
         return SendMessageResponse(
             success=False,
-            message=f"发送消息失败: {str(e)}"
+            message="发送消息失败，请稍后重试"
         )
 
 
@@ -1810,17 +2089,18 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
         username = cookie_details.get('username', '') if cookie_details else ''
-        password = cookie_details.get('password', '') if cookie_details else ''
+        has_password = bool(cookie_details.get('password')) if cookie_details else False
 
         result.append({
             'id': cookie_id,
-            'value': cookie_value,
+            'value': mask_cookie_value(cookie_value),
+            'has_cookie_value': bool(cookie_value),
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'auto_comment': auto_comment,
             'remark': remark,
             'username': username,
-            'password': password,
+            'has_password': has_password,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
         })
     return result
@@ -1856,8 +2136,8 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"添加Cookie失败: {item.id} - {str(e)}", current_user)
-        raise HTTPException(status_code=400, detail=str(e))
+        log_with_user('error', f"添加Cookie失败: {item.id} - {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=400, detail=safe_client_error("添加Cookie失败，请检查输入后重试"))
 
 
 @app.put('/cookies/{cid}')
@@ -1894,7 +2174,8 @@ def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depen
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"更新Cookie失败: {cid} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("更新Cookie失败，请稍后重试"))
 
 
 class CookieAccountInfo(BaseModel):
@@ -1946,12 +2227,12 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新账号信息失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"更新账号信息失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("更新账号信息失败，请稍后重试"))
 
 
 @app.get("/cookie/{cid}/details")
-def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_cookie_account_details(cid: str, include_secrets: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号详细信息（包括用户名、密码、显示浏览器设置）"""
     try:
         # 检查cookie是否属于当前用户
@@ -1967,13 +2248,24 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
+
+        if not include_secrets:
+            details = {
+                **details,
+                'value': mask_cookie_value(details.get('value')),
+                'password': mask_secret_value(details.get('password')),
+                'proxy_pass': mask_secret_value(details.get('proxy_pass')),
+                'has_cookie_value': bool(details.get('value')),
+                'has_password': bool(details.get('password')),
+                'has_proxy_pass': bool(details.get('proxy_pass')),
+            }
         
         return details
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取账号详情失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"获取账号详情失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取账号详情失败，请稍后重试"))
 
 
 # ========================= 代理配置相关接口 =========================
@@ -1988,7 +2280,7 @@ class ProxyConfig(BaseModel):
 
 
 @app.get("/cookie/{cid}/proxy")
-def get_cookie_proxy_config(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_cookie_proxy_config(cid: str, include_secret: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号的代理配置"""
     try:
         # 检查cookie是否属于当前用户
@@ -2001,6 +2293,13 @@ def get_cookie_proxy_config(cid: str, current_user: Dict[str, Any] = Depends(get
 
         # 获取代理配置
         proxy_config = db_manager.get_cookie_proxy_config(cid)
+
+        if not include_secret:
+            proxy_config = {
+                **proxy_config,
+                'proxy_pass': mask_secret_value(proxy_config.get('proxy_pass')),
+                'has_proxy_pass': bool(proxy_config.get('proxy_pass')),
+            }
         
         return {
             'success': True,
@@ -2009,8 +2308,8 @@ def get_cookie_proxy_config(cid: str, current_user: Dict[str, Any] = Depends(get
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取代理配置失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"获取代理配置失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取代理配置失败，请稍后重试"))
 
 
 @app.post("/cookie/{cid}/proxy")
@@ -2065,8 +2364,8 @@ def update_cookie_proxy_config(cid: str, config: ProxyConfig, current_user: Dict
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新代理配置失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"更新代理配置失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("更新代理配置失败，请稍后重试"))
 
 
 # ========================= 账号密码登录相关接口 =========================
@@ -2555,7 +2854,6 @@ async def password_login(
         password_login_sessions[session_id] = {
             'account_id': account_id,
             'account': account,
-            'password': password,
             'show_browser': show_browser,
             'refresh_mode': refresh_mode,  # 保存刷新模式标志
             'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
@@ -3414,7 +3712,8 @@ def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Dep
     """获取指定通知渠道"""
     from db_manager import db_manager
     try:
-        channel = db_manager.get_notification_channel(channel_id)
+        user_id = current_user['user_id']
+        channel = db_manager.get_notification_channel(channel_id, user_id=user_id)
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
         return channel
@@ -3429,11 +3728,13 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
     """更新通知渠道"""
     from db_manager import db_manager
     try:
+        user_id = current_user['user_id']
         success = db_manager.update_notification_channel(
             channel_id,
             channel_data.name,
             channel_data.config,
-            channel_data.enabled
+            channel_data.enabled,
+            user_id=user_id
         )
         if success:
             return {'msg': 'notification channel updated'}
@@ -3450,7 +3751,8 @@ def delete_notification_channel(channel_id: int, current_user: Dict[str, Any] = 
     """删除通知渠道"""
     from db_manager import db_manager
     try:
-        success = db_manager.delete_notification_channel(channel_id)
+        user_id = current_user['user_id']
+        success = db_manager.delete_notification_channel(channel_id, user_id=user_id)
         if success:
             return {'msg': 'notification channel deleted'}
         else:
@@ -3512,7 +3814,7 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         # 检查通知渠道是否存在
-        channel = db_manager.get_notification_channel(notification_data.channel_id)
+        channel = db_manager.get_notification_channel(notification_data.channel_id, user_id=user_id)
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
 
@@ -3532,7 +3834,12 @@ def delete_account_notifications(cid: str, current_user: Dict[str, Any] = Depend
     """删除账号的所有消息通知配置"""
     from db_manager import db_manager
     try:
-        success = db_manager.delete_account_notifications(cid)
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.delete_account_notifications(cid, user_id=user_id)
         if success:
             return {'msg': 'account notifications deleted'}
         else:
@@ -3548,7 +3855,8 @@ def delete_message_notification(notification_id: int, current_user: Dict[str, An
     """删除消息通知配置"""
     from db_manager import db_manager
     try:
-        success = db_manager.delete_message_notification(notification_id)
+        user_id = current_user['user_id']
+        success = db_manager.delete_message_notification(notification_id, user_id=user_id)
         if success:
             return {'msg': 'message notification deleted'}
         else:
@@ -3589,7 +3897,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 获取所有已启用的通知渠道
-        channels = db_manager.get_notification_channels()
+        channels = db_manager.get_notification_channels(current_user['user_id'])
         logger.info(f"获取到的通知渠道: {channels}")
         enabled_channels = [c for c in channels if c.get('enabled', False)]
         logger.info(f"已启用的通知渠道: {enabled_channels}")
@@ -5300,6 +5608,24 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             user_id=user_id
         )
 
+        # 检查是否需要生成对应发货规则
+        generate_delivery_rule = card_data.get('generate_delivery_rule', False)
+        if generate_delivery_rule:
+            try:
+                # 生成发货规则
+                rule_id = db_manager.create_delivery_rule(
+                    keyword=card_data.get('name'),  # 商品关键字设置为卡券名称
+                    card_id=card_id,  # 匹配卡券设置为当前新添加的卡券ID
+                    delivery_count=1,  # 默认发货数量为1
+                    enabled=True,  # 默认启用
+                    description=f"自动生成的发货规则 - 对应卡券: {card_data.get('name')}",
+                    user_id=user_id
+                )
+                log_with_user('info', f"自动生成发货规则成功: 卡券ID={card_id}, 规则ID={rule_id}", current_user)
+            except Exception as e:
+                log_with_user('error', f"生成发货规则失败: {str(e)}", current_user)
+                # 不影响卡券创建，仅记录错误
+
         log_with_user('info', f"卡券创建成功: {card_name} (ID: {card_id})", current_user)
         return {"id": card_id, "message": "卡券创建成功"}
     except Exception as e:
@@ -5327,6 +5653,7 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
     """更新卡券"""
     try:
         from db_manager import db_manager
+        user_id = current_user['user_id']
 
         # 调试日志：记录接收到的多规格数据
         is_multi_spec = card_data.get('is_multi_spec')
@@ -5356,12 +5683,15 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             spec_name=card_data.get('spec_name'),
             spec_value=card_data.get('spec_value'),
             spec_name_2=card_data.get('spec_name_2'),
-            spec_value_2=card_data.get('spec_value_2')
+            spec_value_2=card_data.get('spec_value_2'),
+            user_id=user_id
         )
         if success:
             return {"message": "卡券更新成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5385,6 +5715,7 @@ async def update_card_with_image(
     """更新带图片的卡券"""
     try:
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
+        user_id = current_user['user_id']
 
         # 验证图片文件
         if not image.content_type or not image.content_type.startswith('image/'):
@@ -5422,7 +5753,8 @@ async def update_card_with_image(
             spec_name=spec_name if is_multi_spec else None,
             spec_value=spec_value if is_multi_spec else None,
             spec_name_2=spec_name_2 if is_multi_spec else None,
-            spec_value_2=spec_value_2 if is_multi_spec else None
+            spec_value_2=spec_value_2 if is_multi_spec else None,
+            user_id=user_id
         )
 
         if success:
@@ -5465,21 +5797,78 @@ def get_delivery_stats(current_user: Dict[str, Any] = Depends(get_current_user))
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/delivery-logs/recent")
+def get_recent_delivery_logs(limit: int = 20, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取最近发货日志（真实发货事件，含失败原因）"""
+    try:
+        from db_manager import db_manager
+
+        def extract_spec_mode_context(reason: str):
+            reason_text = (reason or '').strip()
+            context = {
+                'order_spec_mode': None,
+                'rule_spec_mode': None,
+                'item_config_mode': None
+            }
+
+            pattern = re.compile(r'\[(?:[^\]]*?)(order_spec_mode=[^\],]+|rule_spec_mode=[^\],]+|item_config_mode=[^\],]+)(?:[^\]]*?)\]$')
+            if not reason_text or '[' not in reason_text or ']' not in reason_text:
+                return reason_text, context
+
+            bracket_start = reason_text.rfind('[')
+            bracket_end = reason_text.rfind(']')
+            if bracket_start == -1 or bracket_end == -1 or bracket_end < bracket_start:
+                return reason_text, context
+
+            suffix = reason_text[bracket_start:bracket_end + 1]
+            if not pattern.search(suffix):
+                return reason_text, context
+
+            body = suffix[1:-1]
+            for part in body.split(','):
+                key, _, value = part.strip().partition('=')
+                if key in context and value:
+                    context[key] = value.strip()
+
+            cleaned_reason = reason_text[:bracket_start].rstrip()
+            return cleaned_reason or reason_text, context
+
+        user_id = current_user['user_id']
+        safe_limit = max(1, min(int(limit), 200))
+        logs = db_manager.get_recent_delivery_logs(user_id=user_id, limit=safe_limit)
+        for log in logs:
+            cleaned_reason, context = extract_spec_mode_context(log.get('reason'))
+            log['reason'] = cleaned_reason
+            log.update(context)
+        return {"logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/delivery-rules")
 def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建新发货规则"""
     try:
         from db_manager import db_manager
         user_id = current_user['user_id']
+        card_id = rule_data.get('card_id')
+
+        if card_id is not None:
+            card = db_manager.get_card_by_id(card_id, user_id)
+            if not card:
+                raise HTTPException(status_code=404, detail="卡券不存在")
+
         rule_id = db_manager.create_delivery_rule(
             keyword=rule_data.get('keyword'),
-            card_id=rule_data.get('card_id'),
+            card_id=card_id,
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
             user_id=user_id
         )
         return {"id": rule_id, "message": "发货规则创建成功"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5505,10 +5894,17 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
     try:
         from db_manager import db_manager
         user_id = current_user['user_id']
+        card_id = rule_data.get('card_id')
+
+        if card_id is not None:
+            card = db_manager.get_card_by_id(card_id, user_id)
+            if not card:
+                raise HTTPException(status_code=404, detail="卡券不存在")
+
         success = db_manager.update_delivery_rule(
             rule_id=rule_id,
             keyword=rule_data.get('keyword'),
-            card_id=rule_data.get('card_id'),
+            card_id=card_id,
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
@@ -5518,6 +5914,8 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
             return {"message": "发货规则更新成功"}
         else:
             raise HTTPException(status_code=404, detail="发货规则不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5527,11 +5925,14 @@ def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current
     """删除卡券"""
     try:
         from db_manager import db_manager
-        success = db_manager.delete_card(card_id)
+        user_id = current_user['user_id']
+        success = db_manager.delete_card(card_id, user_id)
         if success:
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5547,6 +5948,8 @@ def delete_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(ge
             return {"message": "发货规则删除成功"}
         else:
             raise HTTPException(status_code=404, detail="发货规则不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5925,6 +6328,7 @@ class AIReplySettings(BaseModel):
     model_name: str = "qwen-plus"
     api_key: str = ""
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_type: str = ""
     max_discount_percent: int = 10
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
@@ -5936,6 +6340,7 @@ class AIConfigPreset(BaseModel):
     model_name: str
     api_key: str = ""
     base_url: str = ""
+    api_type: str = ""
 
 
 @app.delete("/items/batch")
@@ -6075,7 +6480,8 @@ def save_ai_config_preset(
             preset_name=preset.preset_name,
             model_name=preset.model_name,
             api_key=preset.api_key,
-            base_url=preset.base_url
+            base_url=preset.base_url,
+            api_type=preset.api_type
         )
         return {"message": "预设保存成功", "preset_id": preset_id}
     except HTTPException:
@@ -6172,17 +6578,26 @@ async def get_logs(lines: int = 200, level: str = None, source: str = None, curr
 @app.get("/risk-control-logs")
 async def get_risk_control_logs(
     cookie_id: str = None,
+    processing_status: str = None,
     limit: int = 100,
     offset: int = 0,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
     """获取风控日志（管理员专用）"""
     try:
-        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, limit={limit}, offset={offset}", admin_user)
+        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, limit={limit}, offset={offset}", admin_user)
 
         # 获取风控日志
-        logs = db_manager.get_risk_control_logs(cookie_id=cookie_id, limit=limit, offset=offset)
-        total_count = db_manager.get_risk_control_logs_count(cookie_id=cookie_id)
+        logs = db_manager.get_risk_control_logs(
+            cookie_id=cookie_id,
+            processing_status=processing_status,
+            limit=limit,
+            offset=offset
+        )
+        total_count = db_manager.get_risk_control_logs_count(
+            cookie_id=cookie_id,
+            processing_status=processing_status
+        )
 
         log_with_user('info', f"风控日志查询成功，共 {len(logs)} 条记录，总计 {total_count} 条", admin_user)
 
@@ -6520,17 +6935,26 @@ def update_user_admin_status(user_id: int, is_admin: bool, admin_user: Dict[str,
 @app.get('/admin/risk-control-logs')
 async def get_admin_risk_control_logs(
     cookie_id: str = None,
+    processing_status: str = None,
     limit: int = 100,
     offset: int = 0,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
     """获取风控日志（管理员专用）"""
     try:
-        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, limit={limit}, offset={offset}", admin_user)
+        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, limit={limit}, offset={offset}", admin_user)
 
         # 获取风控日志
-        logs = db_manager.get_risk_control_logs(cookie_id=cookie_id, limit=limit, offset=offset)
-        total_count = db_manager.get_risk_control_logs_count(cookie_id=cookie_id)
+        logs = db_manager.get_risk_control_logs(
+            cookie_id=cookie_id,
+            processing_status=processing_status,
+            limit=limit,
+            offset=offset
+        )
+        total_count = db_manager.get_risk_control_logs_count(
+            cookie_id=cookie_id,
+            processing_status=processing_status
+        )
 
         log_with_user('info', f"风控日志查询成功，共 {len(logs)} 条记录，总计 {total_count} 条", admin_user)
 
@@ -7405,6 +7829,64 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
 
 
+@app.get('/api/orders/stream')
+def stream_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """订单实时事件流，仅在订单页激活时使用。"""
+    user_id = current_user['user_id']
+    subscriber = order_event_hub.subscribe(user_id)
+
+    def event_generator():
+        try:
+            yield format_sse_event('stream.ready', {'type': 'stream.ready', 'timestamp': int(time.time() * 1000)})
+            while True:
+                try:
+                    event = subscriber.get(timeout=25)
+                    yield format_sse_event(event.get('type', 'message'), event)
+                except queue.Empty:
+                    yield format_sse_event('ping', {'type': 'ping', 'timestamp': int(time.time() * 1000)})
+        finally:
+            order_event_hub.unsubscribe(user_id, subscriber)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        }
+    )
+
+
+@app.delete('/api/orders/{order_id}')
+def delete_user_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除当前用户自己的订单"""
+    try:
+        from db_manager import db_manager
+
+        user_id = current_user['user_id']
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="订单不存在")
+
+        cookie_id = order.get('cookie_id')
+        cookie_info = db_manager.get_cookie_details(cookie_id) if cookie_id else None
+        if not cookie_info or cookie_info.get('user_id') != user_id:
+            raise HTTPException(status_code=403, detail="无权删除此订单")
+
+        success = db_manager.delete_order(order_id, cookie_id=cookie_id)
+        if not success:
+            raise HTTPException(status_code=400, detail="删除订单失败")
+
+        log_with_user('info', f"删除订单成功: {order_id}", current_user)
+        return {"success": True, "message": "订单删除成功"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"删除订单失败: {order_id} - {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail="删除订单失败，请稍后重试")
+
+
 @app.post('/api/orders/{order_id}/deliver')
 async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """手动发货 - 根据订单信息匹配发货规则并发送卡券"""
@@ -7448,52 +7930,327 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         item_info = db_manager.get_item_info(cookie_id, item_id)
         item_title = item_info.get('item_title', '') if item_info else ''
 
-        # 调用自动发货逻辑获取发货内容
-        delivery_content = await xianyu_instance._auto_delivery(
-            item_id=item_id,
-            item_title=item_title,
-            order_id=order_id,
-            send_user_id=buyer_id
-        )
+        try:
+            expected_quantity = max(1, int(order.get('quantity') or 1))
+        except (TypeError, ValueError):
+            expected_quantity = 1
 
-        if delivery_content:
-            # 发送发货内容给买家
-            try:
-                if delivery_content.startswith("__IMAGE_SEND__"):
-                    # 图片类型暂不支持手动发货
-                    log_with_user('warning', f"手动发货: 订单 {order_id} 为图片类型，暂不支持手动发送", current_user)
-                    return {"success": False, "delivered": False, "message": "图片类型卡券暂不支持手动发货"}
-                else:
-                    # 使用现有的WebSocket连接发送消息（与自动发货逻辑一致）
+        progress_summary_before = xianyu_instance._summarize_delivery_progress(order_id, expected_quantity)
+        pending_finalize_units = list(progress_summary_before.get('pending_finalize_unit_indexes') or [])
+        finalize_completed_units = 0
+        for unit_index in pending_finalize_units:
+            pending_finalize_meta = xianyu_instance._get_pending_delivery_finalization_meta(order_id, unit_index)
+            if not pending_finalize_meta:
+                continue
+
+            finalize_result = await xianyu_instance._finalize_delivery_after_send(
+                delivery_meta=pending_finalize_meta,
+                order_id=order_id,
+                item_id=item_id
+            )
+            if not finalize_result.get('success'):
+                xianyu_instance._persist_delivery_finalization_state(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    delivery_meta=pending_finalize_meta,
+                    channel='manual',
+                    status='sent',
+                    last_error=finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
+                )
+                return {"success": False, "delivered": False, "message": finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'}
+
+            xianyu_instance._persist_delivery_finalization_state(
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                delivery_meta=pending_finalize_meta,
+                channel='manual',
+                status='finalized'
+            )
+            finalize_completed_units += 1
+
+        if finalize_completed_units > 0:
+            progress_after_finalize = xianyu_instance._sync_order_delivery_progress(
+                order_id=order_id,
+                cookie_id=cookie_id,
+                expected_quantity=expected_quantity,
+                context="手动发货补完成收尾成功"
+            )
+            publish_order_update_event(order_id, source='manual_delivery_finalize')
+            log_with_user('info', f"检测到订单 {order_id} 存在待完成收尾记录，已先补完成 {finalize_completed_units} 个单元，继续执行补发", current_user)
+        else:
+            progress_after_finalize = progress_summary_before
+
+        remaining_unit_indexes = list(progress_after_finalize.get('remaining_unit_indexes') or [])
+        if not remaining_unit_indexes:
+            aggregate_status = progress_after_finalize.get('aggregate_status')
+            if aggregate_status == 'shipped':
+                return {"success": True, "delivered": True, "message": "订单所有发货单元都已完成，本次仅补完成未收尾记录"}
+            return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
+
+        unit_results = []
+
+        def format_delivery_reason(reason: str, order_spec_mode: str = None, rule_spec_mode: str = None, item_config_mode: str = None) -> str:
+            context_parts = []
+            if order_spec_mode:
+                context_parts.append(f"order_spec_mode={order_spec_mode}")
+            if rule_spec_mode:
+                context_parts.append(f"rule_spec_mode={rule_spec_mode}")
+            if item_config_mode:
+                context_parts.append(f"item_config_mode={item_config_mode}")
+
+            if not context_parts:
+                return reason
+
+            reason_text = (reason or '').strip() or '未提供发货日志原因'
+            if any(part.split('=')[0] + '=' in reason_text for part in context_parts):
+                return reason_text
+            return f"{reason_text} [{', '.join(context_parts)}]"
+
+        for unit_index in remaining_unit_indexes:
+            delivery_result = await xianyu_instance._auto_delivery(
+                item_id=item_id,
+                item_title=item_title,
+                order_id=order_id,
+                send_user_id=buyer_id,
+                include_meta=True,
+                delivery_unit_index=unit_index
+            )
+
+            if isinstance(delivery_result, dict):
+                delivery_content = delivery_result.get('content')
+                delivery_steps = delivery_result.get('delivery_steps') or []
+                delivery_success = bool(delivery_result.get('success') and delivery_content)
+                rule_id = delivery_result.get('rule_id')
+                rule_keyword = delivery_result.get('rule_keyword')
+                card_type = delivery_result.get('card_type')
+                card_id = delivery_result.get('card_id')
+                match_mode = delivery_result.get('match_mode')
+                order_spec_mode = delivery_result.get('order_spec_mode')
+                rule_spec_mode = delivery_result.get('rule_spec_mode')
+                item_config_mode = delivery_result.get('item_config_mode')
+                data_card_pending_consume = delivery_result.get('data_card_pending_consume')
+                data_line = delivery_result.get('data_line')
+                data_reservation_id = delivery_result.get('data_reservation_id')
+                data_reservation_status = delivery_result.get('data_reservation_status')
+                failure_reason = delivery_result.get('error')
+            else:
+                delivery_content = delivery_result
+                delivery_steps = []
+                delivery_success = bool(delivery_content)
+                rule_id = None
+                rule_keyword = None
+                card_type = None
+                card_id = None
+                match_mode = None
+                order_spec_mode = None
+                rule_spec_mode = None
+                item_config_mode = None
+                data_card_pending_consume = None
+                data_line = None
+                data_reservation_id = None
+                data_reservation_status = None
+                failure_reason = None
+
+            if delivery_success:
+                if not delivery_steps:
+                    delivery_steps = xianyu_instance._build_delivery_steps(delivery_content, '')
+
+                try:
                     ws = getattr(xianyu_instance, 'ws', None)
                     if ws:
-                        # 获取订单的sid（会话ID）
                         sid = order.get('sid', '')
                         if sid:
-                            # 提取cid部分（去掉@goofish后缀）
                             cid = sid.replace('@goofish', '')
-                            log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={cid}, buyer_id={buyer_id}", current_user)
-                            await xianyu_instance.send_msg(ws, cid, buyer_id, delivery_content)
+                            log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={cid}, buyer_id={buyer_id}, unit={unit_index}", current_user)
+                            await xianyu_instance._send_delivery_steps(
+                                ws,
+                                cid,
+                                buyer_id,
+                                delivery_steps,
+                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
+                            )
                         else:
-                            # 如果没有sid，尝试用buyer_id作为cid
-                            log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid", current_user)
-                            await xianyu_instance.send_msg(ws, buyer_id, buyer_id, delivery_content)
+                            log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, unit={unit_index}", current_user)
+                            await xianyu_instance._send_delivery_steps(
+                                ws,
+                                buyer_id,
+                                buyer_id,
+                                delivery_steps,
+                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
+                            )
                     else:
-                        # 没有现有连接，回退到send_msg_once
-                        log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_msg_once", current_user)
-                        await xianyu_instance.send_msg_once(buyer_id, item_id, delivery_content)
-                    log_with_user('info', f"手动发货消息已发送: 订单 {order_id}, 买家 {buyer_id}", current_user)
+                        log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, unit={unit_index}", current_user)
+                        await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
 
-                # 更新订单状态为已发货
-                db_manager.insert_or_update_order(order_id=order_id, order_status='shipped')
-                log_with_user('info', f"手动发货成功: 订单 {order_id}", current_user)
-                return {"success": True, "delivered": True, "message": "发货成功，消息已发送给买家"}
-            except Exception as send_error:
-                log_with_user('error', f"手动发货发送消息失败: 订单 {order_id} - {str(send_error)}", current_user)
-                return {"success": False, "delivered": False, "message": f"获取发货内容成功但发送消息失败: {str(send_error)}"}
-        else:
-            log_with_user('warning', f"手动发货失败: 订单 {order_id} - 未匹配到发货规则", current_user)
-            return {"success": False, "delivered": False, "message": "未匹配到发货规则，请检查卡券和发货规则配置"}
+                    if not xianyu_instance._mark_data_reservation_sent_if_needed({
+                        'data_reservation_id': data_reservation_id,
+                        'data_reservation_status': data_reservation_status
+                    }):
+                        xianyu_instance._release_data_reservation_if_needed(
+                            {'data_reservation_id': data_reservation_id},
+                            error=f'手动发货发送成功后标记预占已发送失败(unit={unit_index})'
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': '批量数据预占标记已发送失败'})
+                        continue
+
+                    delivery_meta = {
+                        'success': True,
+                        'rule_id': rule_id,
+                        'card_id': card_id,
+                        'card_type': card_type,
+                        'data_card_pending_consume': data_card_pending_consume,
+                        'data_line': data_line,
+                        'data_reservation_id': data_reservation_id,
+                        'data_reservation_status': data_reservation_status,
+                        'delivery_unit_index': unit_index,
+                    }
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=delivery_meta,
+                        channel='manual',
+                        status='sent'
+                    )
+
+                    finalize_result = await xianyu_instance._finalize_delivery_after_send(
+                        delivery_meta=delivery_meta,
+                        order_id=order_id,
+                        item_id=item_id
+                    )
+                    if not finalize_result.get('success'):
+                        xianyu_instance._persist_delivery_finalization_state(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            delivery_meta=delivery_meta,
+                            channel='manual',
+                            status='sent',
+                            last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
+                        )
+                        db_manager.create_delivery_log(
+                            user_id=user_id,
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            rule_id=rule_id,
+                            rule_keyword=rule_keyword,
+                            card_type=card_type,
+                            match_mode=match_mode,
+                            channel='manual',
+                            status='failed',
+                            reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', order_spec_mode, rule_spec_mode, item_config_mode)
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
+                        continue
+
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=delivery_meta,
+                        channel='manual',
+                        status='finalized'
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_id,
+                        rule_keyword=rule_keyword,
+                        card_type=card_type,
+                        match_mode=match_mode,
+                        channel='manual',
+                        status='success',
+                        reason=format_delivery_reason(f'手动发货第 {unit_index} 个单元发送成功', order_spec_mode, rule_spec_mode, item_config_mode)
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'finalized'})
+                except Exception as send_error:
+                    xianyu_instance._release_data_reservation_if_needed(
+                        {'data_reservation_id': data_reservation_id},
+                        error=f"手动发货发送失败(unit={unit_index}): {str(send_error)}"
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_id,
+                        rule_keyword=rule_keyword,
+                        card_type=card_type,
+                        match_mode=match_mode,
+                        channel='manual',
+                        status='failed',
+                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息发送失败: {str(send_error)}", order_spec_mode, rule_spec_mode, item_config_mode)
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': str(send_error)})
+            else:
+                fail_reason = failure_reason or f"第 {unit_index} 个发货单元未匹配到发货规则，请检查卡券和发货规则配置"
+                db_manager.create_delivery_log(
+                    user_id=user_id,
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    buyer_nick=order.get('buyer_nick'),
+                    rule_id=rule_id,
+                    rule_keyword=rule_keyword,
+                    card_type=card_type,
+                    match_mode=match_mode,
+                    channel='manual',
+                    status='failed',
+                    reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
+                )
+                unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+
+        progress_summary_after = xianyu_instance._sync_order_delivery_progress(
+            order_id=order_id,
+            cookie_id=cookie_id,
+            expected_quantity=expected_quantity,
+            context="手动发货发送成功"
+        )
+        publish_order_update_event(order_id, source='manual_delivery')
+
+        finalized_now = [r for r in unit_results if r.get('status') == 'finalized']
+        pending_finalize_now = [r for r in unit_results if r.get('status') == 'pending_finalize']
+        failed_now = [r for r in unit_results if r.get('status') == 'failed']
+
+        message_parts = []
+        if finalize_completed_units > 0:
+            message_parts.append(f"已补完成 {finalize_completed_units} 个未收尾单元")
+        if finalized_now:
+            message_parts.append(f"本次补发成功 {len(finalized_now)} 个单元")
+        if pending_finalize_now:
+            message_parts.append(f"仍有 {len(pending_finalize_now)} 个单元待收尾")
+        if failed_now:
+            message_parts.append(f"仍有 {len(failed_now)} 个单元补发失败")
+
+        aggregate_status = progress_summary_after.get('aggregate_status')
+        if aggregate_status == 'shipped':
+            message_parts.append(f"订单已全部完成（{progress_summary_after.get('finalized_count', 0)}/{expected_quantity}）")
+        elif aggregate_status == 'partial_pending_finalize':
+            message_parts.append(
+                f"订单当前为部分待收尾（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待收尾 {progress_summary_after.get('pending_finalize_count', 0)}）"
+            )
+        elif aggregate_status == 'partial_success':
+            message_parts.append(
+                f"订单当前为部分发货（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待补发 {progress_summary_after.get('remaining_count', 0)}）"
+            )
+
+        delivered = bool(finalized_now or finalize_completed_units > 0)
+        if not message_parts:
+            message_parts.append("订单当前没有可推进的发货单元")
+
+        return {"success": True, "delivered": delivered, "message": '，'.join(message_parts)}
 
     except Exception as e:
         log_with_user('error', f"手动发货异常: 订单 {order_id} - {str(e)}", current_user)
@@ -7603,6 +8360,7 @@ class UpdateResultResponse(PydanticBaseModel):
     success: bool
     message: str
     updated_files: list = []
+    deleted_files: list = []
     needs_restart: bool = False
     new_version: str = ""
 
@@ -7630,7 +8388,18 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
         
         # 获取需要更新的文件
         files_to_update = await updater.get_files_to_update(manifest)
+        files_to_delete = await updater.get_files_to_delete(manifest)
         total_size = sum(f.size for f in files_to_update)
+
+        if not files_to_update and not files_to_delete:
+            return {
+                "success": True,
+                "data": {
+                    "has_update": False,
+                    "current_version": updater.current_version,
+                    "message": "已是最新版本"
+                }
+            }
         
         return {
             "success": True,
@@ -7641,6 +8410,7 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
                 "description": manifest.description,
                 "changelog": manifest.changelog or [],
                 "files_count": len(files_to_update),
+                "deleted_files_count": len(files_to_delete),
                 "total_size": total_size,
                 "release_date": manifest.release_date,
                 "files": [
@@ -7651,6 +8421,14 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
                         "description": f.description
                     }
                     for f in files_to_update
+                ],
+                "deleted_files": [
+                    {
+                        "path": f.path,
+                        "requires_restart": f.requires_restart,
+                        "description": f.description
+                    }
+                    for f in files_to_delete
                 ]
             }
         }
@@ -7671,8 +8449,8 @@ async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)
     下载并安装所有可用更新
     """
     try:
-        # 只允许管理员执行更新（检查username是否为admin）
-        if current_user.get('username') != 'admin':
+        # 只允许管理员执行更新，兼容历史 admin 用户名判断
+        if not current_user.get('is_admin') and current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
         
         updater = get_updater()

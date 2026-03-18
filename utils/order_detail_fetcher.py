@@ -34,17 +34,42 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 
+def _normalize_cached_amount(amount: Any) -> Optional[float]:
+    if amount in (None, ''):
+        return None
+
+    amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
+    try:
+        return float(amount_clean)
+    except (ValueError, TypeError):
+        return None
+
+
+def _should_use_cached_order(existing_order: Dict[str, Any]) -> bool:
+    if not existing_order:
+        return False
+
+    amount_value = _normalize_cached_amount(existing_order.get('amount'))
+    amount_valid = amount_value is not None and amount_value > 0
+    has_valid_spec = bool((existing_order.get('spec_name') or '').strip() and (existing_order.get('spec_value') or '').strip())
+    status_value = str(existing_order.get('order_status') or '').strip().lower()
+    status_valid = bool(status_value and status_value not in ('unknown', 'processing'))
+
+    return amount_valid and (status_valid or has_valid_spec)
+
+
 class OrderDetailFetcher:
     """闲鱼订单详情获取器"""
 
     # 类级别的锁字典，为每个order_id维护一个锁
     _order_locks = defaultdict(lambda: asyncio.Lock())
 
-    def __init__(self, cookie_string: str = None, headless: bool = True):
+    def __init__(self, cookie_string: str = None, headless: bool = True, cookie_id_for_log: str = "unknown"):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.headless = headless  # 保存headless设置
+        self.cookie_id_for_log = cookie_id_for_log or "unknown"
 
         # 请求头配置
         self.headers = {
@@ -222,20 +247,9 @@ class OrderDetailFetcher:
                     existing_order = db_manager.get_order_by_id(order_id)
 
                     if existing_order:
-                        # 检查金额字段是否有效（不为空且不为0）
                         amount = existing_order.get('amount', '')
-                        amount_valid = False
 
-                        if amount:
-                            # 移除可能的货币符号和空格，检查是否为有效数字
-                            amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                            try:
-                                amount_value = float(amount_clean)
-                                amount_valid = amount_value > 0
-                            except (ValueError, TypeError):
-                                amount_valid = False
-
-                        if amount_valid:
+                        if _should_use_cached_order(existing_order):
                             logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                             print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
@@ -263,8 +277,8 @@ class OrderDetailFetcher:
                             }
                             return result
                         else:
-                            logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                            print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                            logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
+                            print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
                 else:
                     logger.info(f"🔄 订单 {order_id} 强制刷新模式，跳过缓存检查")
 
@@ -335,6 +349,68 @@ class OrderDetailFetcher:
                 # 获取订单状态
                 order_status = await self._get_order_status()
                 logger.info(f"订单 {order_id} 状态: {order_status}")
+
+                # 解析失败时，刷新页面后重试一次，降低偶发结构变化/异步渲染导致的漏解析概率
+                if not self._is_order_detail_parse_success(sku_info, order_status):
+                    self._log_order_detail_parse_event(
+                        event_name="ORDER_DETAIL_PARSE_ALERT",
+                        order_id=order_id,
+                        url=url,
+                        attempt="first",
+                        sku_info=sku_info,
+                        order_status=order_status,
+                        level="warning"
+                    )
+                    logger.warning(
+                        f"订单 {order_id} 首次解析结果不完整，准备刷新页面重试: "
+                        f"sku_info={sku_info}, order_status={order_status}"
+                    )
+                    try:
+                        await self.page.reload(wait_until='networkidle', timeout=timeout * 1000)
+                        await asyncio.sleep(2)
+                        retry_sku_info = await self._get_sku_content()
+                        retry_order_status = await self._get_order_status()
+                        logger.info(
+                            f"订单 {order_id} 重试解析结果: sku_info={retry_sku_info}, "
+                            f"order_status={retry_order_status}"
+                        )
+
+                        if self._is_order_detail_parse_success(retry_sku_info, retry_order_status):
+                            sku_info = retry_sku_info
+                            order_status = retry_order_status
+                            logger.info(f"订单 {order_id} 刷新重试后解析成功")
+                            self._log_order_detail_parse_event(
+                                event_name="ORDER_DETAIL_PARSE_RECOVERED",
+                                order_id=order_id,
+                                url=url,
+                                attempt="retry",
+                                sku_info=sku_info,
+                                order_status=order_status,
+                                level="info"
+                            )
+                        else:
+                            logger.warning(f"订单 {order_id} 刷新重试后仍未解析到完整详情")
+                            self._log_order_detail_parse_event(
+                                event_name="ORDER_DETAIL_PARSE_ALERT",
+                                order_id=order_id,
+                                url=url,
+                                attempt="retry_final",
+                                sku_info=retry_sku_info,
+                                order_status=retry_order_status,
+                                level="warning"
+                            )
+                    except Exception as retry_e:
+                        logger.warning(f"订单 {order_id} 刷新重试解析异常: {retry_e}")
+                        self._log_order_detail_parse_event(
+                            event_name="ORDER_DETAIL_PARSE_ALERT",
+                            order_id=order_id,
+                            url=url,
+                            attempt="retry_exception",
+                            sku_info=sku_info,
+                            order_status=order_status,
+                            level="warning",
+                            error=str(retry_e)
+                        )
 
                 # 获取页面标题
                 try:
@@ -451,18 +527,368 @@ class OrderDetailFetcher:
             logger.error(f"解析SKU内容异常: {e}")
             return {}
 
+    def _normalize_amount_text(self, amount_text: str) -> Optional[str]:
+        """标准化金额文本，返回纯数字字符串（如 29.90）"""
+        try:
+            if amount_text is None:
+                return None
+            text = str(amount_text).strip()
+            if not text:
+                return None
+
+            # 优先提取货币格式
+            money_match = re.search(r'[¥￥$]\s*([0-9]+(?:\.[0-9]{1,2})?)', text)
+            if money_match:
+                return money_match.group(1)
+
+            # 兜底提取纯数字
+            number_match = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)', text)
+            if number_match:
+                return number_match.group(1)
+
+            return None
+        except Exception:
+            return None
+
+    def _has_valid_amount(self, amount_text: Any) -> bool:
+        """判断金额是否可解析为数字（0 也视为有效）"""
+        normalized = self._normalize_amount_text(str(amount_text) if amount_text is not None else '')
+        if normalized is None:
+            return False
+        try:
+            float(normalized)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    def _is_datetime_like(self, text: str) -> bool:
+        """判断文本是否明显像时间/日期，而非规格。"""
+        if not text:
+            return False
+        normalized = str(text).strip()
+        if not normalized:
+            return False
+
+        datetime_patterns = [
+            r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',
+            r'^\d{1,2}:\d{2}(:\d{2})?$',
+            r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?$',
+            r'^\d{10,13}$',
+        ]
+        return any(re.match(pattern, normalized) for pattern in datetime_patterns)
+
+    def _is_valid_spec_candidate(self, spec_name: str, spec_value: str) -> bool:
+        """校验规格候选是否可信，过滤备案信息/时间等误命中。"""
+        name = (spec_name or '').strip()
+        value = (spec_value or '').strip()
+
+        if not name or not value:
+            return False
+
+        # 键名过长通常是正文信息，不是规格名称
+        if len(name) > 20:
+            return False
+
+        # 时间戳/日期误识别
+        if self._is_datetime_like(name) or self._is_datetime_like(value):
+            return False
+
+        # URL/协议字段不是规格
+        invalid_protocol_tokens = ['http://', 'https://', 'fleamarket://']
+        if any(token in name.lower() for token in invalid_protocol_tokens):
+            return False
+        if any(token in value.lower() for token in invalid_protocol_tokens):
+            return False
+
+        # 过滤常见平台资质、订单流程字段
+        invalid_tokens = [
+            '统一社会信用代码', '许可证', '备案', '经营', '广播电视节目',
+            '营业性演出', '集邮市场', '增值电信', 'app备案号',
+            '订单号', '付款', '交易', '退款', '发货', '收货',
+            '买家', '卖家', '地址', '电话', '手机号', '快递', '物流',
+            '创建时间', '付款时间', '成交时间', '下单时间'
+        ]
+        lower_name = name.lower()
+        lower_value = value.lower()
+        if any(token in lower_name for token in invalid_tokens):
+            return False
+        if any(token in lower_value for token in invalid_tokens):
+            return False
+
+        return True
+
+    def _sanitize_sku_result(self, sku_info: Dict[str, str], source: str = "unknown") -> Dict[str, str]:
+        """清洗SKU结果中的可疑规格字段，避免误发。"""
+        if not sku_info:
+            return sku_info
+
+        result = dict(sku_info)
+
+        spec_name = (result.get('spec_name') or '').strip()
+        spec_value = (result.get('spec_value') or '').strip()
+        spec_name_2 = (result.get('spec_name_2') or '').strip()
+        spec_value_2 = (result.get('spec_value_2') or '').strip()
+
+        primary_valid = self._is_valid_spec_candidate(spec_name, spec_value)
+        secondary_valid = self._is_valid_spec_candidate(spec_name_2, spec_value_2) if (spec_name_2 or spec_value_2) else False
+
+        if not primary_valid and (spec_name or spec_value):
+            logger.warning(
+                f"过滤疑似误识别规格(primary, source={source}): {spec_name}:{spec_value}"
+            )
+            result.pop('spec_name', None)
+            result.pop('spec_value', None)
+
+        if not secondary_valid and (spec_name_2 or spec_value_2):
+            logger.warning(
+                f"过滤疑似误识别规格(secondary, source={source}): {spec_name_2}:{spec_value_2}"
+            )
+            result.pop('spec_name_2', None)
+            result.pop('spec_value_2', None)
+
+        # 如果主规格被清掉而次规格有效，则提升次规格为主规格
+        if ('spec_name' not in result or not result.get('spec_name')) and result.get('spec_name_2') and result.get('spec_value_2'):
+            result['spec_name'] = result.pop('spec_name_2')
+            result['spec_value'] = result.pop('spec_value_2')
+            logger.info(f"规格清洗后提升次规格为主规格(source={source})")
+
+        return result
+
+    def _get_status_priority(self, status: str) -> int:
+        priority_map = {
+            'unknown': 0,
+            'pending_payment': 10,
+            'pending_ship': 20,
+            'shipped': 30,
+            'completed': 40,
+            'refunding': 50,
+            'cancelled': 60,
+        }
+        return priority_map.get(status or 'unknown', 0)
+
+    def _extract_status_from_text(self, text: str) -> str:
+        """从任意文本中提取订单状态，优先返回更可靠/更后置的状态。"""
+        if not text:
+            return 'unknown'
+
+        normalized_text = re.sub(r'\s+', ' ', str(text)).strip()
+        if not normalized_text:
+            return 'unknown'
+
+        status_patterns = [
+            ('cancelled', ['交易关闭', '已关闭', '钱款已原路退返', '订单关闭']),
+            ('refunding', ['退款中', '退货退款', '退款关闭']),
+            ('completed', ['买家确认收货', '已确认收货，交易成功', '交易成功', '已完成']),
+            ('shipped', ['等待买家收货', '待收货', '已发货', '查看物流', '确认收货']),
+            ('pending_ship', ['待发货', '等待你发货', '等待卖家发货', '去发货', '付款完成待发货', '记得及时发货']),
+            ('pending_payment', ['待付款', '等待买家付款']),
+        ]
+
+        matched_statuses = []
+        for status, patterns in status_patterns:
+            if any(pattern in normalized_text for pattern in patterns):
+                matched_statuses.append(status)
+
+        if not matched_statuses:
+            return 'unknown'
+
+        matched_statuses.sort(key=self._get_status_priority, reverse=True)
+        return matched_statuses[0]
+
+    async def _collect_texts_by_selectors(self, selectors, *, max_length: int = 40, max_items: int = 12) -> list:
+        """按选择器批量采集文本，自动去重。"""
+        collected = []
+        seen = set()
+
+        for selector in selectors:
+            try:
+                elements = await self.page.query_selector_all(selector)
+            except Exception as e:
+                logger.debug(f"批量采集选择器失败 {selector}: {e}")
+                continue
+
+            for element in elements:
+                try:
+                    text = await element.text_content()
+                except Exception as text_error:
+                    logger.debug(f"读取元素文本失败 {selector}: {text_error}")
+                    continue
+
+                normalized_text = re.sub(r'\s+', ' ', str(text or '')).strip()
+                if not normalized_text:
+                    continue
+                if max_length and len(normalized_text) > max_length:
+                    continue
+                if normalized_text in seen:
+                    continue
+
+                seen.add(normalized_text)
+                collected.append(normalized_text)
+                if len(collected) >= max_items:
+                    return collected
+
+        return collected
+
+    async def _get_page_text(self) -> str:
+        """获取页面可读文本，失败时返回空字符串"""
+        try:
+            return (await self.page.inner_text('body')).strip()
+        except Exception:
+            try:
+                html_content = await self.page.content()
+                return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html_content)).strip()
+            except Exception:
+                return ''
+
+    def _extract_sku_from_text(self, text: str) -> Dict[str, str]:
+        """从页面纯文本中兜底提取金额/规格/数量"""
+        result: Dict[str, str] = {}
+        if not text:
+            return result
+
+        lines = [line.strip() for line in text.splitlines() if line and line.strip()]
+
+        # 优先从金额关键词行提取金额
+        amount_keywords = ['实付款', '订单金额', '实收', '合计', '总价', '应付']
+        for line in lines:
+            if any(keyword in line for keyword in amount_keywords):
+                normalized_amount = self._normalize_amount_text(line)
+                if normalized_amount:
+                    result['amount'] = normalized_amount
+                    break
+
+        # 兜底：从全文提取货币数字
+        if 'amount' not in result:
+            normalized_amount = self._normalize_amount_text(text)
+            if normalized_amount:
+                result['amount'] = normalized_amount
+
+        # 数量提取
+        quantity_patterns = [
+            r'数量\s*[:：]?\s*x?\s*(\d+)',
+            r'\bx\s*(\d{1,3})\b',
+        ]
+        for pattern in quantity_patterns:
+            quantity_match = re.search(pattern, text, re.IGNORECASE)
+            if quantity_match:
+                result['quantity'] = quantity_match.group(1)
+                break
+
+        # 规格提取：过滤明显非规格行
+        spec_candidates = []
+        ignore_tokens = [
+            'http://', 'https://', 'fleamarket://', '订单', '买家', '卖家', '地址',
+            '手机', '电话', '时间', '发货', '付款', '交易', '退款', '去发货', '修改价格',
+            '等待你发货', '等待买家', '已发货', '待收货', '待发货',
+            '统一社会信用代码', '许可证', '备案', '经营', '广播电视节目',
+            '营业性演出', '集邮市场', '增值电信', 'app备案号'
+        ]
+
+        for line in lines:
+            normalized_line = line.replace('：', ':')
+            if ':' not in normalized_line:
+                continue
+            if any(token in normalized_line for token in ignore_tokens):
+                continue
+
+            left, right = normalized_line.split(':', 1)
+            left = left.strip()
+            right = right.strip()
+            if not left or not right:
+                continue
+            if len(left) > 16:
+                continue
+
+            parsed = self._parse_sku_content(f"{left}:{right}")
+            if parsed:
+                sanitized_candidate = self._sanitize_sku_result(parsed, source="text_fallback_candidate")
+                if sanitized_candidate.get('spec_name') and sanitized_candidate.get('spec_value'):
+                    spec_candidates.append(sanitized_candidate)
+
+        if spec_candidates:
+            primary = spec_candidates[0]
+            if primary.get('spec_name') and primary.get('spec_value'):
+                result['spec_name'] = primary['spec_name']
+                result['spec_value'] = primary['spec_value']
+            if primary.get('spec_name_2') and primary.get('spec_value_2'):
+                result['spec_name_2'] = primary['spec_name_2']
+                result['spec_value_2'] = primary['spec_value_2']
+
+            if len(spec_candidates) > 1 and 'spec_name_2' not in result:
+                second = spec_candidates[1]
+                if second.get('spec_name') and second.get('spec_value'):
+                    result['spec_name_2'] = second['spec_name']
+                    result['spec_value_2'] = second['spec_value']
+
+        return self._sanitize_sku_result(result, source="text_fallback_result")
+
+    def _is_order_detail_parse_success(self, sku_info: Optional[Dict[str, str]], order_status: str) -> bool:
+        """判定订单详情解析是否成功（金额/规格/状态任一有效即可）"""
+        info = sku_info or {}
+        has_valid_amount = self._has_valid_amount(info.get('amount'))
+        has_valid_spec = bool(info.get('spec_name') and info.get('spec_value'))
+        has_valid_status = bool(order_status and order_status != 'unknown')
+        return has_valid_amount or has_valid_spec or has_valid_status
+
+    def _build_parse_field_flags(self, sku_info: Optional[Dict[str, str]], order_status: str) -> Dict[str, Any]:
+        """构建解析字段完整性标记，便于统一告警日志检索。"""
+        info = sku_info or {}
+        return {
+            'has_amount': self._has_valid_amount(info.get('amount')),
+            'has_spec': bool(info.get('spec_name') and info.get('spec_value')),
+            'has_status': bool(order_status and order_status != 'unknown'),
+            'amount': info.get('amount', ''),
+            'spec_name': info.get('spec_name', ''),
+            'spec_value': info.get('spec_value', ''),
+            'quantity': info.get('quantity', ''),
+            'order_status': order_status or ''
+        }
+
+    def _log_order_detail_parse_event(
+        self,
+        event_name: str,
+        order_id: str,
+        url: str,
+        attempt: str,
+        sku_info: Optional[Dict[str, str]],
+        order_status: str,
+        level: str = "warning",
+        error: str = None
+    ) -> None:
+        """输出结构化的订单详情解析告警/恢复日志。"""
+        try:
+            field_flags = self._build_parse_field_flags(sku_info, order_status)
+            payload = {
+                'event': event_name,
+                'cookie_id': self.cookie_id_for_log,
+                'order_id': order_id,
+                'attempt': attempt,
+                'url': url,
+                'field_flags': field_flags
+            }
+            if error:
+                payload['error'] = error
+
+            log_msg = f"{event_name} {json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+            if level == "info":
+                logger.info(log_msg)
+            else:
+                logger.warning(log_msg)
+        except Exception as log_error:
+            logger.warning(f"订单解析事件日志输出失败: {log_error}")
+
     async def _get_order_status(self) -> str:
         """
         从订单详情页面获取订单状态
 
         Returns:
             订单状态字符串，可能的值:
-            - 'success': 交易成功
-            - 'closed': 交易关闭
             - 'pending_payment': 待付款
-            - 'pending_delivery': 待发货
+            - 'pending_ship': 待发货
             - 'shipped': 已发货/待收货
+            - 'completed': 交易成功
             - 'refunding': 退款中
+            - 'cancelled': 交易关闭
             - 'unknown': 未知状态
         """
         try:
@@ -477,6 +903,7 @@ class OrderDetailFetcher:
                 '.status-text',
                 '[class*="orderStatus"]',
                 '[class*="StatusText"]',
+                '[class*="status"]',
             ]
 
             status_text = ''
@@ -493,50 +920,48 @@ class OrderDetailFetcher:
                     logger.debug(f"选择器 {selector} 获取失败: {e}")
                     continue
 
-            # 如果选择器都失败，尝试从页面文本中提取
-            if not status_text:
-                try:
-                    page_content = await self.page.content()
-                    # 检查常见的状态文本
-                    status_patterns = [
-                        ('交易成功', 'success'),
-                        ('交易关闭', 'closed'),
-                        ('已关闭', 'closed'),
-                        ('待付款', 'pending_payment'),
-                        ('待发货', 'pending_delivery'),
-                        ('已发货', 'shipped'),
-                        ('待收货', 'shipped'),
-                        ('退款中', 'refunding'),
-                        ('退款成功', 'refunded'),
-                    ]
-                    for pattern, status in status_patterns:
-                        if pattern in page_content:
-                            logger.info(f"从页面内容中检测到订单状态: {pattern} -> {status}")
-                            return status
-                except Exception as e:
-                    logger.warning(f"从页面内容获取状态失败: {e}")
+            button_selectors = [
+                'button',
+                '[role="button"]',
+                '[class*="button"]',
+                '[class*="Button"]',
+                '[class*="btn"]',
+            ]
 
-            # 解析状态文本
+            parsed_from_selector = 'unknown'
+            button_texts = await self._collect_texts_by_selectors(button_selectors, max_length=24, max_items=16)
+            button_status = 'unknown'
+            for button_text in button_texts:
+                candidate_status = self._extract_status_from_text(button_text)
+                if self._get_status_priority(candidate_status) > self._get_status_priority(button_status):
+                    button_status = candidate_status
+
+            # 先解析选择器结果
             if status_text:
-                status_mapping = {
-                    '交易成功': 'success',
-                    '交易关闭': 'closed',
-                    '已关闭': 'closed',
-                    '待付款': 'pending_payment',
-                    '待发货': 'pending_delivery',
-                    '已发货': 'shipped',
-                    '待收货': 'shipped',
-                    '退款中': 'refunding',
-                    '退款成功': 'refunded',
-                }
+                parsed_from_selector = self._extract_status_from_text(status_text)
+                if parsed_from_selector == 'unknown':
+                    logger.warning(f"未知的订单状态文本: {status_text}")
 
-                for text, status in status_mapping.items():
-                    if text in status_text:
-                        logger.info(f"订单状态解析: {status_text} -> {status}")
-                        return status
+            preferred_status = parsed_from_selector
+            if self._get_status_priority(button_status) > self._get_status_priority(preferred_status):
+                preferred_status = button_status
 
-                logger.warning(f"未知的订单状态文本: {status_text}")
-                return 'unknown'
+            logger.info(
+                f"订单状态解析候选: selector={parsed_from_selector} ({status_text or 'empty'}), "
+                f"button={button_status} ({button_texts or []})"
+            )
+
+            if preferred_status != 'unknown':
+                logger.info(f"订单状态解析最终采用结构化结果: {preferred_status}")
+                return preferred_status
+
+            # 如果选择器/按钮都没有有效结果，尝试从页面文本中提取
+            body_text = await self._get_page_text()
+            body_status = self._extract_status_from_text(body_text)
+            logger.info(f"订单状态解析候选: body={body_status}")
+            if body_status != 'unknown':
+                logger.info(f"从页面文本中检测到订单状态 -> {body_status}")
+                return body_status
 
             logger.warning("无法获取订单状态")
             return 'unknown'
@@ -553,29 +978,34 @@ class OrderDetailFetcher:
                 logger.error("浏览器状态异常，无法获取SKU内容")
                 return {}
 
-            result = {}
+            result: Dict[str, str] = {}
 
-            # 获取所有 sku--u_ddZval 元素
+            # 获取规格元素（主通道）
             sku_selector = '.sku--u_ddZval'
             sku_elements = await self.page.query_selector_all(sku_selector)
-
             logger.info(f"找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
-            print(f"🔍 找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
 
-            # 获取金额信息
-            amount_selector = '.boldNum--JgEOXfA3'
-            amount_element = await self.page.query_selector(amount_selector)
-            amount = ''
-            if amount_element:
-                amount_text = await amount_element.text_content()
-                if amount_text:
-                    amount = amount_text.strip()
-                    logger.info(f"找到金额: {amount}")
-                    print(f"💰 金额: {amount}")
-                    result['amount'] = amount
-            else:
-                logger.warning("未找到金额元素")
-                print("⚠️ 未找到金额信息")
+            # 获取金额（多选择器兜底）
+            amount_selectors = [
+                '.boldNum--JgEOXfA3',
+                '[class*="boldNum"]',
+                '[class*="pay"] [class*="num"]',
+                '[class*="amount"] [class*="num"]',
+                '[class*="price"] [class*="num"]',
+            ]
+            for amount_selector in amount_selectors:
+                try:
+                    amount_element = await self.page.query_selector(amount_selector)
+                    if not amount_element:
+                        continue
+                    amount_text = await amount_element.text_content()
+                    normalized_amount = self._normalize_amount_text(amount_text or '')
+                    if normalized_amount:
+                        result['amount'] = normalized_amount
+                        logger.info(f"通过选择器 {amount_selector} 找到金额: {normalized_amount}")
+                        break
+                except Exception as selector_e:
+                    logger.debug(f"金额选择器 {amount_selector} 解析失败: {selector_e}")
 
             # 收集所有元素的内容
             all_contents = []
@@ -585,7 +1015,6 @@ class OrderDetailFetcher:
                     content = content.strip()
                     all_contents.append(content)
                     logger.info(f"元素 {i+1} 原始内容: {content}")
-                    print(f"📋 元素 {i+1}: {content}")
 
             # 分类：规格 vs 数量
             specs = []
@@ -606,21 +1035,17 @@ class OrderDetailFetcher:
                         # 其他情况当作规格处理
                         specs.append(content)
 
-            # 解析规格1
+            # 解析规格1（主通道）
             if len(specs) >= 1:
                 parsed_spec = self._parse_sku_content(specs[0])
                 if parsed_spec:
                     result['spec_name'] = parsed_spec['spec_name']
                     result['spec_value'] = parsed_spec['spec_value']
-                    print(f"📋 规格1名称: {parsed_spec['spec_name']}")
-                    print(f"📝 规格1值: {parsed_spec['spec_value']}")
 
                     # 检查第一个规格是否已包含双规格（分号分隔的情况）
                     if 'spec_name_2' in parsed_spec and 'spec_value_2' in parsed_spec:
                         result['spec_name_2'] = parsed_spec['spec_name_2']
                         result['spec_value_2'] = parsed_spec['spec_value_2']
-                        print(f"📋 规格2名称（来自分号分隔）: {parsed_spec['spec_name_2']}")
-                        print(f"📝 规格2值（来自分号分隔）: {parsed_spec['spec_value_2']}")
 
             # 解析规格2（如果存在且尚未从分号分隔中获取）
             if len(specs) >= 2 and 'spec_name_2' not in result:
@@ -628,18 +1053,14 @@ class OrderDetailFetcher:
                 if parsed_spec2:
                     result['spec_name_2'] = parsed_spec2['spec_name']
                     result['spec_value_2'] = parsed_spec2['spec_value']
-                    print(f"📋 规格2名称: {parsed_spec2['spec_name']}")
-                    print(f"📝 规格2值: {parsed_spec2['spec_value']}")
 
             # 如果有更多规格，记录日志（目前只支持双规格）
             if len(specs) > 2:
                 logger.warning(f"检测到 {len(specs)} 个规格，目前只支持双规格，多余的规格将被忽略")
-                print(f"⚠️ 检测到 {len(specs)} 个规格，只处理前两个")
 
             # 解析数量
             if quantity_content:
                 logger.info(f"数量原始内容: {quantity_content}")
-                print(f"📦 数量原始内容: {quantity_content}")
 
                 if ':' in quantity_content:
                     quantity_value = quantity_content.split(':', 1)[1].strip()
@@ -652,39 +1073,41 @@ class OrderDetailFetcher:
 
                 result['quantity'] = quantity_value
                 logger.info(f"提取到数量: {quantity_value}")
-                print(f"🔢 数量: {quantity_value}")
 
-            # 处理特殊情况：没有找到任何元素
-            if len(sku_elements) == 0:
-                result['quantity'] = '1'
-                logger.info("未找到sku--u_ddZval元素，数量默认设置为1")
-                print("📦 数量默认设置为: 1")
+            # 如果核心字段缺失，使用页面文本兜底
+            if (
+                'amount' not in result
+                or 'spec_name' not in result
+                or 'spec_value' not in result
+                or 'quantity' not in result
+            ):
+                page_text = await self._get_page_text()
+                fallback_result = self._extract_sku_from_text(page_text)
 
-                # 尝试获取页面的所有class包含sku的元素进行调试
-                all_sku_elements = await self.page.query_selector_all('[class*="sku"]')
-                if all_sku_elements:
-                    logger.info(f"找到 {len(all_sku_elements)} 个包含'sku'的元素")
-                    for i, element in enumerate(all_sku_elements):
-                        class_name = await element.get_attribute('class')
-                        text_content = await element.text_content()
-                        logger.info(f"SKU元素 {i+1}: class='{class_name}', text='{text_content}'")
+                for key in ['amount', 'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2', 'quantity']:
+                    if key not in result and fallback_result.get(key):
+                        result[key] = fallback_result[key]
+
+                if fallback_result:
+                    logger.info(f"SKU文本兜底解析结果: {fallback_result}")
 
             # 确保数量字段存在，如果不存在则设置为1
             if 'quantity' not in result:
                 result['quantity'] = '1'
                 logger.info("未获取到数量信息，默认设置为1")
-                print("📦 数量默认设置为: 1")
+
+            # 对最终规格做二次清洗，防止主通道/兜底误识别正文字段
+            cleaned_result = self._sanitize_sku_result(result, source="sku_final")
+            if cleaned_result != result:
+                logger.warning(f"SKU结果已清洗: before={result}, after={cleaned_result}")
+            result = cleaned_result
 
             # 打印最终结果
             if result:
                 logger.info(f"最终解析结果: {result}")
-                print("✅ 解析结果:")
-                for key, value in result.items():
-                    print(f"   {key}: {value}")
                 return result
             else:
                 logger.warning("未能解析到任何有效信息")
-                print("❌ 未能解析到任何有效信息")
                 # 即使没有其他信息，也要返回默认数量
                 return {'quantity': '0'}
 
@@ -793,7 +1216,13 @@ class OrderDetailFetcher:
 
 
 # 便捷函数
-async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, headless: bool = True, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+async def fetch_order_detail_simple(
+    order_id: str,
+    cookie_string: str = None,
+    headless: bool = True,
+    force_refresh: bool = False,
+    cookie_id_for_log: str = "unknown"
+) -> Optional[Dict[str, Any]]:
     """
     简单的订单详情获取函数（优化版：先检查数据库，再初始化浏览器）
 
@@ -802,6 +1231,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
         cookie_string: Cookie字符串，如果不提供则使用默认值
         headless: 是否无头模式
         force_refresh: 是否强制刷新（跳过缓存直接从闲鱼获取）
+        cookie_id_for_log: 日志上下文中的账号ID，用于定位异常账号
 
     Returns:
         订单详情字典，包含以下字段：
@@ -824,19 +1254,9 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
             existing_order = db_manager.get_order_by_id(order_id)
 
             if existing_order:
-                # 检查金额字段是否有效
                 amount = existing_order.get('amount', '')
-                amount_valid = False
 
-                if amount:
-                    amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                    try:
-                        amount_value = float(amount_clean)
-                        amount_valid = amount_value > 0
-                    except (ValueError, TypeError):
-                        amount_valid = False
-
-                if amount_valid:
+                if _should_use_cached_order(existing_order):
                     logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                     print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
@@ -865,8 +1285,8 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
                     }
                     return result
                 else:
-                    logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                    print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                    logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
+                    print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
         except Exception as e:
             logger.warning(f"检查数据库缓存失败: {e}")
     else:
@@ -877,7 +1297,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
     logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
     print(f"🔍 订单 {order_id} 开始浏览器获取详情...")
 
-    fetcher = OrderDetailFetcher(cookie_string, headless)
+    fetcher = OrderDetailFetcher(cookie_string, headless, cookie_id_for_log=cookie_id_for_log)
     try:
         if await fetcher.init_browser(headless=headless):
             return await fetcher.fetch_order_detail(order_id, force_refresh=force_refresh)

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>闲鱼自动回复管理系统</title>
+  <title>闲鱼管理系统</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
   <!-- 防止主题闪烁：先隐藏页面，设置好主题后再显示 -->
   <style>
@@ -12,6 +12,33 @@
   </style>
   <script>
     (function() {
+      function adjustBrightness(hex, percent) {
+        var num = parseInt(hex.replace('#', ''), 16);
+        var amt = Math.round(2.55 * percent);
+        var r = (num >> 16) + amt;
+        var g = ((num >> 8) & 0x00ff) + amt;
+        var b = (num & 0x0000ff) + amt;
+
+        return (
+          '#' +
+          (
+            0x1000000 +
+            (r < 255 ? (r < 1 ? 0 : r) : 255) * 0x10000 +
+            (g < 255 ? (g < 1 ? 0 : g) : 255) * 0x100 +
+            (b < 255 ? (b < 1 ? 0 : b) : 255)
+          )
+            .toString(16)
+            .slice(1)
+        );
+      }
+
+      var cachedThemeColor = localStorage.getItem('themeColor');
+      if (/^#[0-9A-Fa-f]{6}$/.test(cachedThemeColor)) {
+        document.documentElement.style.setProperty('--primary-color', cachedThemeColor);
+        document.documentElement.style.setProperty('--primary-hover', adjustBrightness(cachedThemeColor, -20));
+        document.documentElement.style.setProperty('--primary-light', adjustBrightness(cachedThemeColor, 40));
+      }
+
       var savedMode = localStorage.getItem('darkMode');
       if (savedMode === 'dark') {
         document.documentElement.setAttribute('data-theme', 'dark');
@@ -24,6 +51,7 @@
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
 
   <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
   <!-- 移动端菜单切换按钮 -->
@@ -44,7 +72,7 @@
     </div>
     <nav class="sidebar-nav">
       <div class="nav-item" data-menu-id="dashboard">
-        <a href="#" class="nav-link active" onclick="showSection('dashboard')">
+        <a href="javascript:void(0)" class="nav-link active" onclick="showSection('dashboard')">
           <i class="bi bi-speedometer2"></i>
           <span>仪表盘</span>
         </a>
@@ -188,10 +216,36 @@
             <p class="text-muted mb-0">系统概览和统计信息</p>
           </div>
           <div class="version-info d-flex gap-2">
-            <span class="badge bg-secondary" id="systemVersion" style="cursor: pointer;" onclick="showChangelogModal()" title="点击查看更新日志">
+            <span class="badge d-inline-flex align-items-center version-pill" id="systemVersion" onclick="showChangelogModal()" title="点击查看更新日志">
               <i class="bi bi-info-circle me-1"></i>
               版本: <span id="versionNumber">加载中...</span>
             </span>
+            <div class="btn-group dashboard-hot-update-group" id="dashboardHotUpdateGroup" style="display: none;">
+              <button type="button" class="btn btn-sm dashboard-hot-update-btn d-inline-flex align-items-center" id="dashboardHotUpdateBtn" onclick="performHotUpdate()">
+                <i class="bi bi-cloud-download me-1"></i>检查更新
+              </button>
+              <button type="button" class="btn btn-sm dashboard-hot-update-menu-btn dropdown-toggle dropdown-toggle-split" id="dashboardHotUpdateMenuBtn" data-bs-toggle="dropdown" aria-expanded="false">
+                <span class="visually-hidden">切换更新菜单</span>
+              </button>
+              <ul class="dropdown-menu dropdown-menu-end shadow-sm dashboard-hot-update-dropdown">
+                <li>
+                  <button type="button" class="dropdown-item" id="dashboardHotUpdateAutoCheckToggle" onclick="toggleHotUpdateAutoCheck()">
+                    关闭自动检查
+                  </button>
+                </li>
+                <li>
+                  <button type="button" class="dropdown-item" id="dashboardClearIgnoredVersionBtn" onclick="clearIgnoredUpdateVersion()">
+                    清除忽略版本
+                  </button>
+                </li>
+                <li><hr class="dropdown-divider"></li>
+                <li>
+                  <div class="dropdown-item-text small text-muted" id="dashboardHotUpdatePreferenceHint">
+                    当前浏览器生效
+                  </div>
+                </li>
+              </ul>
+            </div>
             <!-- 最新权益功能暂时隐藏
             <span class="badge bg-gradient" id="benefitsBadge" style="cursor: pointer; background: linear-gradient(135deg, #ff6b6b, #feca57, #48dbfb) !important; color: #fff; animation: benefitsGlow 2s ease-in-out infinite;" onclick="showBenefitsModal()">
               <i class="bi bi-gift me-1"></i>
@@ -226,36 +280,168 @@
           </div>
           <div class="stat-card">
             <div class="stat-icon info">
-              <i class="bi bi-receipt-cutoff"></i>
+              <i class="bi bi-box-seam"></i>
             </div>
-            <div class="stat-number" id="totalOrders">0</div>
-            <div class="stat-label">总订单数</div>
+            <div class="stat-number" id="totalItems">0</div>
+            <div class="stat-label">商品总数</div>
           </div>
         </div>
 
-        <!-- 账号详情列表 -->
-        <div class="card">
+        <div class="card dashboard-orders-card mb-4">
           <div class="card-header">
             <h5 class="mb-0">
-              <i class="bi bi-list-ul me-2"></i>
-              账号详情
+              <i class="bi bi-graph-up-arrow me-2"></i>
+              订单数据看板
             </h5>
           </div>
-          <div class="card-body p-0">
-            <div class="table-responsive">
-              <table class="table table-hover mb-0">
-                <thead>
-                  <tr>
-                    <th>账号ID</th>
-                    <th>关键词数量</th>
-                    <th>状态</th>
-                    <th>最后更新</th>
-                  </tr>
-                </thead>
-                <tbody id="dashboardAccountsList">
-                  <!-- 动态生成 -->
-                </tbody>
-              </table>
+          <div class="card-body">
+            <div class="order-kpi-grid">
+              <div class="order-kpi-item">
+                <div class="order-kpi-label">订单总数</div>
+                <div class="order-kpi-value" id="dashboardOrderTotal">0</div>
+              </div>
+              <div class="order-kpi-item">
+                <div class="order-kpi-label">销售总金额</div>
+                <div class="order-kpi-value" id="dashboardSalesAmount">￥0.00</div>
+              </div>
+              <div class="order-kpi-item">
+                <div class="order-kpi-label">订单完成率</div>
+                <div class="order-kpi-value" id="dashboardCompletionRate">0.0%</div>
+              </div>
+              <div class="order-kpi-item">
+                <div class="order-kpi-label">当日订单数</div>
+                <div class="order-kpi-value" id="dashboardTodayOrders">0</div>
+              </div>
+            </div>
+            
+            <!-- 销售额数据展示模块 -->
+            <div class="sales-summary-section mt-4">
+              <h6 class="mb-3">
+                <i class="bi bi-cash-coin me-1"></i>
+                销售额统计
+              </h6>
+              <div class="sales-kpi-grid">
+                <div class="sales-kpi-item">
+                  <div class="sales-kpi-label">当日销售额</div>
+                  <div class="sales-kpi-value" id="dashboardTodaySales">
+                    <span class="sales-value-loading">加载中...</span>
+                  </div>
+                </div>
+                <div class="sales-kpi-item">
+                  <div class="sales-kpi-label">本周销售额</div>
+                  <div class="sales-kpi-value" id="dashboardWeekSales">
+                    <span class="sales-value-loading">加载中...</span>
+                  </div>
+                </div>
+                <div class="sales-kpi-item">
+                  <div class="sales-kpi-label">本月销售额</div>
+                  <div class="sales-kpi-value" id="dashboardMonthSales">
+                    <span class="sales-value-loading">加载中...</span>
+                  </div>
+                </div>
+                <div class="sales-kpi-item">
+                  <div class="sales-kpi-label">更新时间</div>
+                  <div class="sales-kpi-value" id="dashboardSalesUpdateTime">--</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 销售额折线图 -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <div class="d-flex justify-content-between align-items-center">
+              <h5 class="mb-0">
+                <i class="bi bi-bar-chart me-2"></i>
+                销售额趋势
+              </h5>
+              <div class="time-range-selector">
+                <div class="btn-group" role="group">
+                  <button type="button" class="btn btn-sm btn-primary" data-period="week" onclick="loadSalesChart('week')">最近1周</button>
+                  <button type="button" class="btn btn-sm btn-primary" data-period="month" onclick="loadSalesChart('month')">最近1月</button>
+                  <button type="button" class="btn btn-sm btn-primary" data-period="custom" onclick="toggleDateRangePicker()">自定义</button>
+                </div>
+                <div id="dateRangePicker" class="date-range-picker mt-2" style="display: none;">
+                  <div class="input-group input-group-sm">
+                    <input type="date" class="form-control" id="startDate">
+                    <span class="input-group-text">至</span>
+                    <input type="date" class="form-control" id="endDate">
+                    <button class="btn btn-sm btn-primary" onclick="loadCustomSalesChart()">查询</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-container" style="height: 300px;">
+              <canvas id="salesChart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="row g-4 dashboard-half-panels">
+          <!-- 账号详情列表 -->
+          <div class="col-12 col-xl-6">
+            <div class="card h-100">
+              <div class="card-header">
+                <h5 class="mb-0">
+                  <i class="bi bi-list-ul me-2"></i>
+                  账号详情
+                </h5>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-hover mb-0 dashboard-account-table">
+                    <thead>
+                      <tr>
+                        <th>账号ID</th>
+                        <th>关键词数量</th>
+                        <th>状态</th>
+                        <th>最后更新</th>
+                      </tr>
+                    </thead>
+                    <tbody id="dashboardAccountsList">
+                      <!-- 动态生成 -->
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 发货日志 -->
+          <div class="col-12 col-xl-6">
+            <div class="card h-100">
+              <div class="card-header">
+                <h5 class="mb-0">
+                  <i class="bi bi-truck me-2"></i>
+                  发货日志
+                </h5>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-hover mb-0 dashboard-delivery-log-table">
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>订单ID</th>
+                        <th>规则/匹配</th>
+                        <th>状态</th>
+                        <th>原因</th>
+                      </tr>
+                    </thead>
+                    <tbody id="dashboardDeliveryLogsList">
+                      <tr>
+                        <td colspan="5" class="text-center text-muted py-4">
+                          <i class="bi bi-inbox fs-1 d-block mb-2"></i>
+                          暂无发货日志
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -418,30 +604,38 @@
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">
             <span><i class="bi bi-list-ul me-2"></i>账号列表</span>
-            <div class="btn-group">
-              <button class="btn btn-sm btn-outline-success" onclick="openDefaultReplyManager()">
-                <i class="bi bi-chat-text me-1"></i>默认回复管理
-              </button>
-              <button class="btn btn-sm btn-outline-primary" onclick="loadCookies()">
-                <i class="bi bi-arrow-clockwise me-1"></i>刷新
-              </button>
+            <div class="d-flex align-items-center gap-2">
+              <div class="input-group input-group-sm" style="width: auto;">
+                <span class="input-group-text">回复延迟</span>
+                <input type="text" class="form-control text-center" id="debounceDelay" value="3" style="width: 50px;" inputmode="numeric" pattern="[0-9]*">
+                <span class="input-group-text">秒</span>
+                <button class="btn btn-sm btn-outline-primary" onclick="saveDebounceDelay()">保存</button>
+              </div>
+              <div class="btn-group">
+                <button class="btn btn-sm btn-outline-success" onclick="openDefaultReplyManager()">
+                  <i class="bi bi-chat-text me-1"></i>默认回复管理
+                </button>
+                <button class="btn btn-sm btn-outline-primary" onclick="loadCookies()">
+                  <i class="bi bi-arrow-clockwise me-1"></i>刷新
+                </button>
+              </div>
             </div>
           </div>
           <div class="card-body p-0">
             <div class="table-responsive">
-              <table class="table table-hover" id="cookieTable">
+              <table class="table table-hover text-center" id="cookieTable">
                 <thead>
                   <tr>
-                    <th style="width: 9%">账号ID</th>
-                    <th style="width: 14%">Cookie值</th>
-                    <th style="width: 7%">关键词</th>
-                    <th style="width: 7%">状态</th>
-                    <th style="width: 8%">默认回复</th>
-                    <th style="width: 8%">AI回复</th>
-                    <th style="width: 8%">自动确认发货</th>
-                    <th style="width: 10%">自动好评</th>
-                    <th style="width: 9%">备注</th>
-                    <th style="width: 10%">
+                    <th style="width: 8%">账号ID</th>
+                    <th style="width: 11%">Cookie值</th>
+                    <th style="width: 6%">关键词</th>
+                    <th style="width: 6%">状态</th>
+                    <th style="width: 7%">默认回复</th>
+                    <th style="width: 6%">AI回复</th>
+                    <th style="width: 9%">自动确认发货</th>
+                    <th style="width: 7%">自动好评</th>
+                    <th style="width: 11%">备注</th>
+                    <th style="width: 11%; white-space: nowrap;">
                       暂停时间
                       <i class="bi bi-question-circle ms-1"
                          data-bs-toggle="tooltip"
@@ -503,11 +697,6 @@
               </div>
             </div>
 
-            <!-- 搜索结果统计 -->
-            <div id="itemSearchStats" class="text-muted small" style="display: none;">
-              <i class="bi bi-search me-1"></i>
-              <span id="itemSearchStatsText"></span>
-            </div>
           </div>
         </div>
 
@@ -617,18 +806,13 @@
           <div class="card-body">
             <div class="row align-items-end">
               <div class="col-md-6">
-                <label for="itemCookieFilter" class="form-label">筛选账号</label>
+                <label for="itemReplayCookieFilter" class="form-label">筛选账号</label>
                 <select class="form-select" id="itemReplayCookieFilter" onchange="loadItemsReplayByCookie()">
                   <option value="">所有账号</option>
                 </select>
               </div>
               <div class="col-md-6">
                 <div class="d-flex justify-content-end align-items-end gap-2">
-                  <!-- 页码输入 -->
-                  <div class="d-flex align-items-center gap-2">
-                    <label for="pageNumber" class="form-label mb-0 text-nowrap">页码:</label>
-                    <input type="number" class="form-control" id="pageNumber" placeholder="页码" min="1" value="1" style="width: 80px;">
-                  </div>
                   <div class="d-flex gap-2">
                     <button class="btn btn-success" onclick="showItemReplayEdit()">
                       添加商品回复
@@ -647,7 +831,7 @@
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">
             <h5 class="mb-0">商品列表(用于设置商品的默认回复信息)</h5>
-            <button class="btn btn-sm btn-outline-danger" onclick="batchDeleteItemReplies()">
+            <button class="btn btn-sm btn-outline-danger" id="batchDeleteItemRepliesBtn" onclick="batchDeleteItemReplies()" disabled>
               <i class="bi bi-trash"></i> 批量删除
             </button>
           </div>
@@ -657,7 +841,7 @@
                 <thead>
                   <tr>
                     <th style="width: 5%">
-                      <input type="checkbox" id="selectAllItemReplay" onchange="toggleSelectAll(this)">
+                      <input type="checkbox" id="selectAllItemReplies" onchange="toggleSelectAllItemReplies(this)">
                     </th>
                     <th style="width: 12%">账号ID</th>
                     <th style="width: 12%">商品ID</th>
@@ -670,7 +854,7 @@
                 </thead>
                 <tbody id="itemReplaysTableBody">
                   <tr>
-                    <td colspan="5" class="text-center text-muted">加载中...</td>
+                    <td colspan="8" class="text-center text-muted">加载中...</td>
                   </tr>
                 </tbody>
               </table>
@@ -714,7 +898,7 @@
             </div>
 
             <div class="mb-3">
-              <label for="editReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
+              <label for="editItemReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
               <textarea class="form-control" id="editItemReplyContent" rows="10"
                         placeholder="请输入商品回复内容..."></textarea>
               <div class="form-text">
@@ -759,12 +943,13 @@
               <option value="">所有状态</option>
               <option value="processing">处理中</option>
               <option value="pending_payment">待付款</option>
-              <option value="pending_delivery">待发货</option>
+              <option value="pending_ship">待发货</option>
+              <option value="partial_success">部分发货</option>
+              <option value="partial_pending_finalize">部分待收尾</option>
               <option value="shipped">已发货</option>
-              <option value="success">交易成功</option>
+              <option value="completed">交易成功</option>
               <option value="refunding">退款中</option>
-              <option value="refunded">退款成功</option>
-              <option value="closed">交易关闭</option>
+              <option value="cancelled">交易关闭</option>
               <option value="unknown">未知</option>
             </select>
           </div>
@@ -1943,18 +2128,18 @@
               <div class="col-md-3">
                 <label class="form-label">处理状态</label>
                 <div class="d-flex gap-2 flex-wrap">
-                  <span class="badge bg-secondary filter-badge active" data-status="" onclick="filterRiskLogsByStatus('')">
+                  <button type="button" class="badge bg-secondary filter-badge active border-0" data-status="" onclick="filterRiskLogsByStatus('')">
                     全部
-                  </span>
-                  <span class="badge bg-warning filter-badge" data-status="processing" onclick="filterRiskLogsByStatus('processing')">
+                  </button>
+                  <button type="button" class="badge bg-warning filter-badge border-0" data-status="processing" onclick="filterRiskLogsByStatus('processing')">
                     处理中
-                  </span>
-                  <span class="badge bg-success filter-badge" data-status="success" onclick="filterRiskLogsByStatus('success')">
+                  </button>
+                  <button type="button" class="badge bg-success filter-badge border-0" data-status="success" onclick="filterRiskLogsByStatus('success')">
                     成功
-                  </span>
-                  <span class="badge bg-danger filter-badge" data-status="failed" onclick="filterRiskLogsByStatus('failed')">
+                  </button>
+                  <button type="button" class="badge bg-danger filter-badge border-0" data-status="failed" onclick="filterRiskLogsByStatus('failed')">
                     失败
-                  </span>
+                  </button>
                 </div>
               </div>
               <div class="col-md-2">
@@ -1976,8 +2161,8 @@
               <i class="bi bi-list-ul me-2"></i>
               风控日志记录
             </h5>
-            <div class="d-flex gap-2">
-              <span id="riskLogCount" class="badge bg-info">总计: 0 条</span>
+            <div class="d-flex gap-2 align-items-center">
+              <span id="riskLogCount" class="badge bg-info toolbar-count-badge">记录数: 0 条</span>
               <button class="btn btn-sm btn-outline-danger" onclick="clearRiskControlLogs()" title="清空日志">
                 <i class="bi bi-trash"></i> 清空
               </button>
@@ -3241,6 +3426,19 @@
               </small>
             </div>
 
+            <div class="mb-3">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="generateDeliveryRule">
+                <label class="form-check-label" for="generateDeliveryRule">
+                  <strong>生成对应发货规则</strong>
+                </label>
+              </div>
+              <small class="form-text text-muted">
+                <i class="bi bi-info-circle me-1"></i>
+                启用后，创建卡券时会自动生成一条对应的自动发货规则，商品关键字为当前卡券名称，匹配卡券为当前卡券。
+              </small>
+            </div>
+
             <!-- 多规格设置 -->
             <div class="mb-3">
               <div class="form-check form-switch">
@@ -3752,7 +3950,7 @@
 
   <!-- JS依赖 -->
   <script src="/static/lib/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/static/js/app.js?v=1.2.2b"></script>
+  <script src="/static/js/app.js?v=1.2.9"></script>
 
   <!-- 默认回复管理模态框 -->
   <div class="modal fade" id="defaultReplyModal" tabindex="-1" aria-labelledby="defaultReplyModalLabel" aria-hidden="true">
@@ -3816,11 +4014,11 @@
         </div>
         <div class="modal-body">
           <form id="editDefaultReplyForm">
-            <input type="hidden" id="editAccountId" />
+            <input type="hidden" id="editDefaultReplyAccountId" />
 
             <div class="mb-3">
               <label class="form-label">账号ID</label>
-              <input type="text" class="form-control" id="editAccountIdDisplay" readonly />
+              <input type="text" class="form-control" id="editDefaultReplyAccountIdDisplay" readonly />
             </div>
 
             <div class="mb-3">
@@ -3919,31 +4117,49 @@
 
   <!-- AI回复配置模态框 -->
   <div class="modal fade" id="aiReplyConfigModal" tabindex="-1">
-    <div class="modal-dialog modal-lg">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title">
-            <i class="bi bi-robot me-2"></i>AI回复配置
-          </h5>
+    <div class="modal-dialog modal-lg ai-reply-dialog">
+      <div class="modal-content ai-reply-content">
+        <div class="modal-header ai-reply-header">
+          <div class="ai-reply-title-group">
+            <h5 class="modal-title">
+              <i class="bi bi-robot me-2"></i>AI回复配置
+            </h5>
+            <small class="ai-reply-subtitle">为当前账号统一管理模型、供应商、策略与联调测试</small>
+          </div>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <form id="aiReplyConfigForm">
+          <form id="aiReplyConfigForm" class="ai-reply-form">
             <input type="hidden" id="aiConfigAccountId">
 
+            <div class="ai-modal-intro mb-3">
+              <div class="ai-intro-icon"><i class="bi bi-stars"></i></div>
+              <div class="ai-intro-content">
+                <div class="ai-intro-title">配置建议</div>
+                <div class="ai-intro-text">先完成基础连接，再配置议价和提示词，最后在测试区验证回复效果。</div>
+              </div>
+            </div>
+
             <!-- 基本设置 -->
-            <div class="card mb-3">
-              <div class="card-header">
-                <h6 class="mb-0"><i class="bi bi-gear me-2"></i>基本设置</h6>
+            <div class="card mb-3 ai-section-card ai-basic-card">
+              <div class="card-header ai-section-header">
+                <div class="ai-section-title">
+                  <h6 class="mb-0"><i class="bi bi-gear me-2"></i>基本设置</h6>
+                  <small class="ai-section-desc">账号与连接参数</small>
+                </div>
+                <span class="ai-section-tag">连接层</span>
               </div>
               <div class="card-body">
-                <div class="row mb-3">
-                  <div class="col-md-6">
-                    <label class="form-label">账号ID</label>
-                    <input type="text" class="form-control" id="aiConfigAccountIdDisplay" readonly>
+                <div class="ai-basic-overview mb-3">
+                  <div class="ai-account-panel">
+                    <label class="form-label mb-2">账号ID</label>
+                    <div class="ai-account-field">
+                      <i class="bi bi-person-badge"></i>
+                      <input type="text" class="form-control" id="aiConfigAccountIdDisplay" readonly>
+                    </div>
                   </div>
-                  <div class="col-md-6">
-                    <div class="form-check form-switch mt-4">
+                  <div class="ai-enable-panel">
+                    <div class="form-check form-switch ai-enable-switch">
                       <input class="form-check-input" type="checkbox" id="aiReplyEnabled"
                         onchange="toggleAIReplySettings()">
                       <label class="form-check-label" for="aiReplyEnabled">
@@ -3954,22 +4170,24 @@
                   </div>
                 </div>
 
-                <div id="aiReplySettings" style="display: none;">
-                  <div class="row mb-3 align-items-end">
-                    <div class="col">
-                      <label class="form-label">API配置预设</label>
-                      <div class="d-flex gap-2">
-                        <select class="form-select" id="aiPresetSelect" onchange="loadAIPreset()">
-                          <option value="">-- 选择预设 --</option>
-                        </select>
+                <div id="aiReplySettings" class="ai-config-stack" style="display: none;">
+                  <div class="ai-config-block ai-preset-block">
+                    <label class="form-label mb-1">API配置预设</label>
+                    <small class="form-text text-muted d-block mb-2">保存常用配置，一键切换到不同供应商参数</small>
+                    <div class="ai-preset-controls">
+                      <select class="form-select" id="aiPresetSelect" onchange="loadAIPreset()">
+                        <option value="">-- 选择预设 --</option>
+                      </select>
+                      <div class="ai-preset-actions">
                         <button type="button" class="btn btn-outline-primary btn-sm text-nowrap" onclick="saveCurrentAsPreset()">保存预设</button>
                         <button type="button" class="btn btn-outline-danger btn-sm text-nowrap" id="deletePresetBtn" style="display:none;" onclick="deleteSelectedPreset()">删除</button>
                       </div>
                     </div>
                   </div>
-                  <div class="row mb-3">
-                    <div class="col-md-6">
-                      <label for="aiModelName" class="form-label">AI模型</label>
+
+                  <div class="ai-config-grid">
+                    <div class="ai-config-item">
+                      <label for="aiModelName" class="form-label"><i class="bi bi-cpu me-1"></i>AI模型</label>
                       <select class="form-select" id="aiModelName" onchange="toggleCustomModelInput()">
                         <optgroup label="DashScope (推荐)">
                           <option value="deepseek-v3.2">DeepSeek V3.2</option>
@@ -3988,111 +4206,163 @@
                       <input type="text" class="form-control mt-2" id="customModelName" placeholder="请输入自定义模型名称"
                         style="display: none;">
                     </div>
-                    <div class="col-md-6">
-                      <label for="aiBaseUrl" class="form-label">API地址</label>
-                      <input type="url" class="form-control" id="aiBaseUrl"
-                        value="https://dashscope.aliyuncs.com/compatible-mode/v1" placeholder="API Base URL">
-                    </div>
-                  </div>
 
-                  <div class="mb-3">
-                    <label for="aiApiKey" class="form-label">API密钥 <span class="text-danger">*</span></label>
-                    <input type="password" class="form-control" id="aiApiKey" placeholder="请输入API密钥" required>
-                    <small class="form-text text-muted">
-                      通义千问请使用DashScope API Key，GPT请使用OpenAI API Key
-                    </small>
+                    <div class="ai-config-item">
+                      <label for="aiApiType" class="form-label"><i class="bi bi-diagram-3 me-1"></i>API类型</label>
+                      <select class="form-select" id="aiApiType" onchange="updateApiUrlPreview()">
+                        <option value="">自动识别</option>
+                        <option value="openai">OpenAI (Chat Completions)</option>
+                        <option value="openai_responses">OpenAI (Responses API)</option>
+                        <option value="gemini">Google Gemini</option>
+                        <option value="anthropic">Anthropic Claude</option>
+                        <option value="azure_openai">Azure OpenAI</option>
+                        <option value="ollama">Ollama</option>
+                      </select>
+                      <small class="form-text text-muted">选择你的API服务商，或使用自动识别</small>
+                    </div>
+
+                    <div class="ai-config-item ai-config-item-wide">
+                      <label for="aiBaseUrl" class="form-label"><i class="bi bi-link-45deg me-1"></i>API地址</label>
+                      <input type="url" class="form-control" id="aiBaseUrl"
+                        value="https://dashscope.aliyuncs.com/compatible-mode/v1" placeholder="API Base URL"
+                        oninput="updateApiUrlPreview()">
+                      <div class="ai-endpoint-preview" id="apiUrlPreview"></div>
+                    </div>
+
+                    <div class="ai-config-item ai-config-item-wide">
+                      <label for="aiApiKey" class="form-label"><i class="bi bi-key me-1"></i>API密钥 <span class="text-danger">*</span></label>
+                      <input type="password" class="form-control" id="aiApiKey" placeholder="请输入API密钥" required>
+                      <small class="form-text text-muted">通义千问请使用DashScope API Key，GPT请使用OpenAI API Key</small>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
             <!-- 议价设置 -->
-            <div class="card mb-3" id="bargainSettings" style="display: none;">
-              <div class="card-header">
-                <h6 class="mb-0"><i class="bi bi-currency-dollar me-2"></i>议价设置</h6>
+            <div class="card mb-3 ai-section-card" id="bargainSettings" style="display: none;">
+              <div class="card-header ai-section-header">
+                <div class="ai-section-title">
+                  <h6 class="mb-0"><i class="bi bi-currency-dollar me-2"></i>议价设置</h6>
+                  <small class="ai-section-desc">控制自动让价边界与节奏</small>
+                </div>
+                <span class="ai-section-tag">策略层</span>
               </div>
               <div class="card-body">
-                <div class="row mb-3">
-                  <div class="col-md-4">
+                <div class="ai-bargain-grid">
+                  <div class="ai-metric-card">
                     <label for="maxDiscountPercent" class="form-label">最大优惠百分比</label>
                     <div class="input-group">
                       <input type="number" class="form-control" id="maxDiscountPercent"
                              min="0" max="50" value="10">
                       <span class="input-group-text">%</span>
                     </div>
+                    <small class="form-text text-muted mt-2 d-block">限制单次让价比例，建议 5-15</small>
                   </div>
-                  <div class="col-md-4">
+
+                  <div class="ai-metric-card">
                     <label for="maxDiscountAmount" class="form-label">最大优惠金额</label>
                     <div class="input-group">
                       <input type="number" class="form-control" id="maxDiscountAmount"
                              min="0" value="100">
                       <span class="input-group-text">元</span>
                     </div>
+                    <small class="form-text text-muted mt-2 d-block">限制累计让利总额，避免超预算</small>
                   </div>
-                  <div class="col-md-4">
+
+                  <div class="ai-metric-card">
                     <label for="maxBargainRounds" class="form-label">最大议价轮数</label>
                     <input type="number" class="form-control" id="maxBargainRounds"
                            min="1" max="10" value="3">
+                    <small class="form-text text-muted mt-2 d-block">超过轮数后自动保持底线回复</small>
                   </div>
                 </div>
               </div>
             </div>
 
             <!-- 提示词设置 -->
-            <div class="card mb-3" id="promptSettings" style="display: none;">
-              <div class="card-header">
-                <h6 class="mb-0"><i class="bi bi-chat-quote me-2"></i>提示词设置</h6>
+            <div class="card mb-3 ai-section-card" id="promptSettings" style="display: none;">
+              <div class="card-header ai-section-header">
+                <div class="ai-section-title">
+                  <h6 class="mb-0"><i class="bi bi-chat-quote me-2"></i>提示词设置</h6>
+                  <small class="ai-section-desc">按场景微调回复风格与边界</small>
+                </div>
+                <span class="ai-section-tag">语义层</span>
               </div>
               <div class="card-body">
-                <small class="form-text text-muted d-block mb-3">留空使用系统默认提示词，填写则覆盖对应场景的默认策略。</small>
-
-                <div class="mb-3">
-                  <label class="form-label fw-bold">议价场景</label>
-                  <small class="form-text text-muted d-block mb-1">当买家明确要求降价、优惠、砍价时的应对策略</small>
-                  <textarea class="form-control" id="promptPrice" rows="4"
-                            placeholder="【议价场景】&#10;策略：根据议价次数递减优惠&#10;- 第1次：可小幅优惠，表达诚意&#10;- 第2次：中等优惠，强调已是优惠价&#10;- 第3次及以后：最大优惠或坚持底线&#10;语气友好但坚定，突出商品价值和优势。"></textarea>
+                <div class="ai-prompt-tip mb-3">
+                  <i class="bi bi-lightbulb me-2"></i>
+                  留空使用系统默认提示词，填写后仅覆盖对应场景，不影响其它场景策略。
                 </div>
 
-                <div class="mb-3">
-                  <label class="form-label fw-bold">技术/产品问题</label>
-                  <small class="form-text text-muted d-block mb-1">当买家询问产品功能、使用方法、技术细节时的回复策略</small>
-                  <textarea class="form-control" id="promptTech" rows="3"
-                            placeholder="【技术/产品问题】&#10;基于商品信息回答，不要自行发挥。&#10;如果问题超出商品信息范围，回复：&quot;等等，这个我需要看一看&quot;"></textarea>
-                </div>
+                <div class="ai-prompt-grid">
+                  <div class="ai-prompt-card">
+                    <div class="ai-prompt-head">
+                      <span class="ai-prompt-dot ai-prompt-dot-price"></span>
+                      <label class="form-label fw-bold mb-0">议价场景</label>
+                    </div>
+                    <small class="form-text text-muted d-block mb-2">当买家明确要求降价、优惠、砍价时的应对策略</small>
+                    <textarea class="form-control ai-prompt-textarea" id="promptPrice" rows="4"
+                              placeholder="【议价场景】&#10;策略：根据议价次数递减优惠&#10;- 第1次：可小幅优惠，表达诚意&#10;- 第2次：中等优惠，强调已是优惠价&#10;- 第3次及以后：最大优惠或坚持底线&#10;语气友好但坚定，突出商品价值和优势。"></textarea>
+                  </div>
 
-                <div class="mb-3">
-                  <label class="form-label fw-bold">一般咨询</label>
-                  <small class="form-text text-muted d-block mb-1">物流、售后、商品介绍等其他咨询的回复策略</small>
-                  <textarea class="form-control" id="promptDefault" rows="3"
-                            placeholder="【一般咨询】&#10;基于商品信息回答物流、售后等问题。&#10;如果问题超出商品信息范围，回复：&quot;等等，这个我需要看一看&quot;&#10;如果客户明确询问退款，回复：&quot;虚拟产品，一旦发出是不可以退款的&quot;"></textarea>
+                  <div class="ai-prompt-card">
+                    <div class="ai-prompt-head">
+                      <span class="ai-prompt-dot ai-prompt-dot-tech"></span>
+                      <label class="form-label fw-bold mb-0">技术/产品问题</label>
+                    </div>
+                    <small class="form-text text-muted d-block mb-2">当买家询问产品功能、使用方法、技术细节时的回复策略</small>
+                    <textarea class="form-control ai-prompt-textarea" id="promptTech" rows="3"
+                              placeholder="【技术/产品问题】&#10;基于商品信息回答，不要自行发挥。&#10;如果问题超出商品信息范围，回复：&quot;等等，这个我需要看一看&quot;"></textarea>
+                  </div>
+
+                  <div class="ai-prompt-card ai-prompt-card-wide">
+                    <div class="ai-prompt-head">
+                      <span class="ai-prompt-dot ai-prompt-dot-default"></span>
+                      <label class="form-label fw-bold mb-0">一般咨询</label>
+                    </div>
+                    <small class="form-text text-muted d-block mb-2">物流、售后、商品介绍等其他咨询的回复策略</small>
+                    <textarea class="form-control ai-prompt-textarea" id="promptDefault" rows="3"
+                              placeholder="【一般咨询】&#10;基于商品信息回答物流、售后等问题。&#10;如果问题超出商品信息范围，回复：&quot;等等，这个我需要看一看&quot;&#10;如果客户明确询问退款，回复：&quot;虚拟产品，一旦发出是不可以退款的&quot;"></textarea>
+                  </div>
                 </div>
               </div>
             </div>
 
             <!-- 测试区域 -->
-            <div class="card" id="testArea" style="display: none;">
-              <div class="card-header">
-                <h6 class="mb-0"><i class="bi bi-play-circle me-2"></i>功能测试</h6>
+            <div class="card ai-section-card" id="testArea" style="display: none;">
+              <div class="card-header ai-section-header">
+                <div class="ai-section-title">
+                  <h6 class="mb-0"><i class="bi bi-play-circle me-2"></i>功能测试</h6>
+                  <small class="ai-section-desc">联调参数并预览最终回复</small>
+                </div>
+                <span class="ai-section-tag">验证层</span>
               </div>
               <div class="card-body">
-                <div class="row mb-3">
-                  <div class="col-md-6">
+                <div class="ai-test-grid">
+                  <div class="ai-test-input">
                     <label for="testMessage" class="form-label">测试消息</label>
                     <input type="text" class="form-control" id="testMessage"
                            value="你好，这个商品能便宜点吗？" placeholder="输入测试消息">
                   </div>
-                  <div class="col-md-6">
+
+                  <div class="ai-test-input">
                     <label for="testItemPrice" class="form-label">商品价格</label>
                     <input type="number" class="form-control" id="testItemPrice"
                            value="100" placeholder="商品价格">
                   </div>
                 </div>
-                <button type="button" class="btn btn-outline-primary" onclick="testAIReply()">
-                  <i class="bi bi-play me-1"></i>测试AI回复
-                </button>
-                <div id="testResult" class="mt-3" style="display: none;">
-                  <div class="alert alert-info">
-                    <strong>AI回复：</strong>
+
+                <div class="ai-test-actions">
+                  <button type="button" class="btn btn-outline-primary ai-test-btn" onclick="testAIReply()">
+                    <i class="bi bi-play me-1"></i>测试AI回复
+                  </button>
+                  <small class="form-text text-muted">使用当前配置发起一次模拟请求，用于快速校验效果</small>
+                </div>
+
+                <div id="testResult" class="ai-test-result mt-3" style="display: none;">
+                  <div class="alert alert-info mb-0">
+                    <div class="fw-semibold mb-2"><i class="bi bi-chat-left-quote me-1"></i>AI回复结果</div>
                     <div id="testReplyContent"></div>
                   </div>
                 </div>
@@ -4100,11 +4370,16 @@
             </div>
           </form>
         </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-          <button type="button" class="btn btn-primary" onclick="saveAIReplyConfig()">
-            <i class="bi bi-check-lg me-1"></i>保存配置
-          </button>
+        <div class="modal-footer ai-reply-footer">
+          <div class="ai-footer-note">
+            <i class="bi bi-shield-check me-1"></i>配置仅作用于当前账号，可随时调整
+          </div>
+          <div class="ai-footer-actions">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+            <button type="button" class="btn btn-primary" onclick="saveAIReplyConfig()">
+              <i class="bi bi-check-lg me-1"></i>保存配置
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -4292,13 +4567,13 @@
         <div class="modal-header">
           <h5 class="modal-title">
             <i class="bi bi-pencil-square me-2"></i>
-            编辑账号信息 - <span id="editAccountIdDisplay"></span>
+            编辑账号信息 - <span id="accountEditIdDisplay"></span>
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <form id="accountEditForm">
-            <input type="hidden" id="editAccountId">
+            <input type="hidden" id="accountEditId">
             
             <div class="mb-3">
               <label class="form-label">Cookie <span class="text-danger">*</span></label>

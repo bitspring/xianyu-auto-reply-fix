@@ -54,6 +54,7 @@ Thumbs.db
 # IDE files
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -61,6 +62,7 @@ Thumbs.db
 # Local environment files
 .env.local
 .env.*.local
+update_files.json
 
 # ==================== 项目特定文件 ====================
 # 日志文件
@@ -795,3 +797,11 @@ qr_screenshots/
 update_backup/
 logs/
 .ace-tool/
+
+# 前端预览文件
+static/control-tower-preview.html
+
+# 本地保留的统计相关脚本
+usage_statistics.py
+simple_stats_server.py
+test_php_stats.py

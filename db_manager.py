@@ -12,6 +12,7 @@ import base64
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
+from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 
 class DBManager:
@@ -50,6 +51,8 @@ class DBManager:
         logger.info(f"数据库路径: {self.db_path}")
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
+        self.secret_fernet = None
+        self.secret_key_path = None
 
         # SQL日志配置 - 默认启用
         self.sql_log_enabled = True  # 默认启用SQL日志
@@ -63,7 +66,211 @@ class DBManager:
 
         logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
 
+        self._init_secret_cipher()
+
         self.init_db()
+        try:
+            self.recover_stale_batch_data_reservations()
+        except Exception as e:
+            logger.warning(f"恢复过期批量数据预占失败: {e}")
+        try:
+            self._migrate_plaintext_cookie_secrets()
+        except Exception as e:
+            logger.warning(f"迁移明文账号敏感信息失败: {e}")
+
+    def _init_secret_cipher(self):
+        """初始化敏感字段加密器。"""
+        env_key = os.getenv('SECRET_ENCRYPTION_KEY', '').strip()
+        if env_key:
+            key = env_key.encode('utf-8')
+        else:
+            db_dir = os.path.dirname(self.db_path) or '.'
+            self.secret_key_path = os.path.join(db_dir, '.secret_encryption.key')
+            if os.path.exists(self.secret_key_path):
+                with open(self.secret_key_path, 'rb') as f:
+                    key = f.read().strip()
+            else:
+                key = Fernet.generate_key()
+                with open(self.secret_key_path, 'wb') as f:
+                    f.write(key)
+                try:
+                    os.chmod(self.secret_key_path, 0o600)
+                except Exception:
+                    pass
+
+        self.secret_fernet = Fernet(key)
+
+    def _is_encrypted_secret(self, value: Any) -> bool:
+        return isinstance(value, str) and value.startswith('enc$')
+
+    def _encrypt_secret(self, value: Any) -> Any:
+        if value is None:
+            return None
+        text = str(value)
+        if text == '':
+            return ''
+        if self._is_encrypted_secret(text):
+            return text
+        token = self.secret_fernet.encrypt(text.encode('utf-8')).decode('utf-8')
+        return f'enc${token}'
+
+    def _decrypt_secret(self, value: Any) -> str:
+        if value in (None, ''):
+            return ''
+        text = str(value)
+        if not self._is_encrypted_secret(text):
+            return text
+        try:
+            return self.secret_fernet.decrypt(text[4:].encode('utf-8')).decode('utf-8')
+        except InvalidToken:
+            logger.warning("检测到无法解密的敏感字段，按原值返回")
+            return text
+
+    def _migrate_plaintext_cookie_secrets(self):
+        """将 cookies 表中的明文敏感字段迁移为密文存储。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(cursor, "SELECT id, value, password, proxy_pass FROM cookies")
+            rows = cursor.fetchall()
+            updated_count = 0
+
+            for cookie_id, cookie_value, password, proxy_pass in rows:
+                update_fields = []
+                params = []
+
+                if cookie_value and not self._is_encrypted_secret(cookie_value):
+                    update_fields.append("value = ?")
+                    params.append(self._encrypt_secret(cookie_value))
+
+                if password and not self._is_encrypted_secret(password):
+                    update_fields.append("password = ?")
+                    params.append(self._encrypt_secret(password))
+
+                if proxy_pass and not self._is_encrypted_secret(proxy_pass):
+                    update_fields.append("proxy_pass = ?")
+                    params.append(self._encrypt_secret(proxy_pass))
+
+                if not update_fields:
+                    continue
+
+                params.append(cookie_id)
+                self._execute_sql(cursor, f"UPDATE cookies SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
+                updated_count += 1
+
+            if updated_count:
+                self.conn.commit()
+                logger.info(f"已迁移 {updated_count} 条 cookies 敏感字段为密文存储")
+
+    def _normalize_order_status(self, status: str) -> str:
+        """标准化订单状态，统一为系统内部状态值。"""
+        if status is None:
+            return None
+
+        normalized = str(status).strip().lower()
+        if not normalized:
+            return None
+
+        status_map = {
+            # 内部标准状态
+            'processing': 'processing',
+            'pending_payment': 'pending_payment',
+            'pending_ship': 'pending_ship',
+            'pending_delivery': 'pending_ship',
+            'partial_success': 'partial_success',
+            'partial_pending_finalize': 'partial_pending_finalize',
+            'shipped': 'shipped',
+            'completed': 'completed',
+            'refunding': 'refunding',
+            'refund_cancelled': 'refund_cancelled',
+            'cancelled': 'cancelled',
+            'unknown': 'unknown',
+            # 常见外部/历史状态兼容
+            'success': 'completed',
+            'refunded': 'cancelled',
+            'closed': 'cancelled',
+            'canceled': 'cancelled',
+            'delivered': 'shipped',
+            # 中文状态兼容
+            '处理中': 'processing',
+            '待发货': 'pending_ship',
+            '部分发货': 'partial_success',
+            '部分待收尾': 'partial_pending_finalize',
+            '已发货': 'shipped',
+            '已完成': 'completed',
+            '退款中': 'refunding',
+            '退款撤销': 'refund_cancelled',
+            '已关闭': 'cancelled',
+        }
+
+        mapped = status_map.get(normalized, normalized)
+        if mapped != normalized:
+            logger.info(f"标准化订单状态: {status} -> {mapped}")
+        elif normalized not in {
+            'processing', 'pending_payment', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed',
+            'refunding', 'refund_cancelled', 'cancelled', 'unknown'
+        }:
+            logger.warning(f"检测到未映射订单状态，按原值保存: {status}")
+        return mapped
+
+    def _get_order_status_priority(self, status: str) -> int:
+        normalized = self._normalize_order_status(status)
+        priority_map = {
+            'processing': 10,
+            'pending_payment': 15,
+            'pending_ship': 20,
+            'partial_success': 30,
+            'partial_pending_finalize': 30,
+            'shipped': 40,
+            'completed': 50,
+            'refunding': 60,
+            'refund_cancelled': 65,
+            'cancelled': 70,
+        }
+        return priority_map.get(normalized, 0)
+
+    def resolve_external_order_status(self, current_status: str, incoming_status: str, source: str = "external_sync") -> str:
+        """合并外部/旁路状态写入，避免更粗粒度状态覆盖内部进度状态。"""
+        normalized_current = self._normalize_order_status(current_status)
+        normalized_incoming = self._normalize_order_status(incoming_status)
+
+        if not normalized_incoming or normalized_incoming == 'unknown':
+            return None
+
+        if not normalized_current or normalized_current == 'unknown':
+            return normalized_incoming
+
+        blocked_incoming_map = {
+            'pending_payment': {'processing'},
+            'pending_ship': {'processing', 'pending_payment'},
+            'partial_success': {'processing', 'pending_payment', 'pending_ship', 'shipped'},
+            'partial_pending_finalize': {'processing', 'pending_payment', 'pending_ship', 'shipped'},
+            'shipped': {'processing', 'pending_payment', 'pending_ship'},
+            'completed': {'processing', 'pending_payment', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped'},
+            'refunding': {'processing', 'pending_payment', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped'},
+            'cancelled': {'processing', 'pending_payment', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'refunding'},
+        }
+
+        blocked_incoming = blocked_incoming_map.get(normalized_current, set())
+        if normalized_incoming in blocked_incoming:
+            logger.warning(
+                f"忽略外部订单状态覆盖: source={source}, current={normalized_current}, incoming={normalized_incoming}"
+            )
+            return normalized_current
+
+        current_priority = self._get_order_status_priority(normalized_current)
+        incoming_priority = self._get_order_status_priority(normalized_incoming)
+        if (
+            current_priority
+            and incoming_priority
+            and incoming_priority < current_priority
+            and normalized_incoming not in {'refunding', 'cancelled', 'refund_cancelled'}
+        ):
+            logger.warning(
+                f"忽略低优先级外部状态覆盖: source={source}, current={normalized_current}, incoming={normalized_incoming}"
+            )
+            return normalized_current
+
+        return normalized_incoming
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -156,6 +363,7 @@ class DBManager:
                 model_name TEXT DEFAULT 'qwen-plus',
                 api_key TEXT,
                 base_url TEXT DEFAULT 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                api_type TEXT DEFAULT '',
                 max_discount_percent INTEGER DEFAULT 10,
                 max_discount_amount INTEGER DEFAULT 100,
                 max_bargain_rounds INTEGER DEFAULT 3,
@@ -175,6 +383,7 @@ class DBManager:
                 model_name TEXT NOT NULL,
                 api_key TEXT NOT NULL DEFAULT '',
                 base_url TEXT NOT NULL DEFAULT '',
+                api_type TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -249,6 +458,7 @@ class DBManager:
                 quantity TEXT,
                 amount TEXT,
                 order_status TEXT DEFAULT 'unknown',
+                pre_refund_status TEXT,
                 cookie_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -274,6 +484,14 @@ class DBManager:
                 logger.info("正在为 orders 表添加 buyer_nick 列...")
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN buyer_nick TEXT")
                 logger.info("orders 表 buyer_nick 列添加完成")
+
+            # 检查并添加 pre_refund_status 列到 orders 表（用于退款撤销跨重启回退）
+            try:
+                self._execute_sql(cursor, "SELECT pre_refund_status FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 pre_refund_status 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN pre_refund_status TEXT")
+                logger.info("orders 表 pre_refund_status 列添加完成")
 
             # 检查并添加 user_id 列（用于数据库迁移）
             try:
@@ -346,6 +564,77 @@ class DBManager:
                 FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
             )
             ''')
+
+            # 创建发货日志表（记录真实发货尝试结果：成功/失败）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                cookie_id TEXT,
+                order_id TEXT,
+                item_id TEXT,
+                buyer_id TEXT,
+                buyer_nick TEXT,
+                rule_id INTEGER,
+                rule_keyword TEXT,
+                card_type TEXT,
+                match_mode TEXT,
+                channel TEXT NOT NULL DEFAULT 'auto',
+                status TEXT NOT NULL DEFAULT 'failed',
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE SET NULL,
+                FOREIGN KEY (rule_id) REFERENCES delivery_rules(id) ON DELETE SET NULL
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_logs_user_time ON delivery_logs(user_id, created_at)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_logs_order_id ON delivery_logs(order_id)")
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_finalization_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                unit_index INTEGER NOT NULL DEFAULT 1,
+                cookie_id TEXT,
+                item_id TEXT,
+                buyer_id TEXT,
+                channel TEXT NOT NULL DEFAULT 'auto',
+                status TEXT NOT NULL DEFAULT 'sent',
+                delivery_meta TEXT,
+                last_error TEXT,
+                sent_at TIMESTAMP,
+                finalized_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(order_id, unit_index)
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_finalization_states_status ON delivery_finalization_states(status, updated_at)")
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS data_card_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_id INTEGER NOT NULL,
+                order_id TEXT NOT NULL,
+                cookie_id TEXT,
+                buyer_id TEXT,
+                unit_index INTEGER NOT NULL DEFAULT 1,
+                reserved_content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved',
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sent_at TIMESTAMP,
+                finalized_at TIMESTAMP,
+                released_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_data_card_reservations_card_status ON data_card_reservations(card_id, status)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_data_card_reservations_order_status ON data_card_reservations(order_id, status)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_data_card_reservations_card_order_unit ON data_card_reservations(card_id, order_id, unit_index)")
 
             # 创建默认回复表
             cursor.execute('''
@@ -556,7 +845,7 @@ Cookie数量: {cookie_count}
             ('smtp_port', '587', 'SMTP端口'),
             ('smtp_user', '', 'SMTP登录用户名（发件邮箱）'),
             ('smtp_password', '', 'SMTP登录密码/授权码'),
-            ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
+            ('smtp_from', '', '发件人显示名（留空则使用邮箱地址）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
@@ -613,6 +902,22 @@ Cookie数量: {cookie_count}
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
+
+            # 检查ai_reply_settings表是否存在api_type列
+            cursor.execute("PRAGMA table_info(ai_reply_settings)")
+            ai_columns = [column[1] for column in cursor.fetchall()]
+            if 'api_type' not in ai_columns:
+                logger.info("添加ai_reply_settings表的api_type列...")
+                cursor.execute("ALTER TABLE ai_reply_settings ADD COLUMN api_type TEXT DEFAULT ''")
+                logger.info("数据库迁移完成：添加api_type列")
+
+            # 检查ai_config_presets表是否存在api_type列
+            cursor.execute("PRAGMA table_info(ai_config_presets)")
+            preset_columns = [column[1] for column in cursor.fetchall()]
+            if 'api_type' not in preset_columns:
+                logger.info("添加ai_config_presets表的api_type列...")
+                cursor.execute("ALTER TABLE ai_config_presets ADD COLUMN api_type TEXT NOT NULL DEFAULT ''")
+                logger.info("数据库迁移完成：添加ai_config_presets.api_type列")
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
@@ -855,7 +1160,7 @@ Cookie数量: {cookie_count}
                     INSERT INTO users (username, email, password_hash) VALUES
                     ('admin', 'admin@localhost', ?)
                     ''', (default_password_hash,))
-                logger.info("创建默认admin用户，密码: admin123")
+                logger.info("创建默认admin用户，默认密码已初始化，请尽快修改")
 
             # 获取admin用户ID，用于历史数据绑定
             self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
@@ -1448,10 +1753,22 @@ Cookie数量: {cookie_count}
         if not self.sql_log_enabled:
             return
 
+        # 格式化SQL（移除多余空白）
+        formatted_sql = ' '.join(sql.split())
+        sql_lower = formatted_sql.lower()
+        sensitive_keywords = ('password', 'proxy_pass', 'smtp_password', 'admin_password_hash')
+        contains_sensitive = any(keyword in sql_lower for keyword in sensitive_keywords)
+
         # 格式化参数
         params_str = ""
         if params:
-            if isinstance(params, (list, tuple)):
+            # 包含敏感字段的SQL统一脱敏参数，避免日志泄露密码等敏感信息
+            if contains_sensitive:
+                if isinstance(params, (list, tuple)):
+                    params_str = f" | 参数: [***敏感参数已脱敏，共{len(params)}项***]"
+                else:
+                    params_str = " | 参数: [***敏感参数已脱敏***]"
+            elif isinstance(params, (list, tuple)):
                 if len(params) > 0:
                     # 限制参数长度，避免日志过长
                     formatted_params = []
@@ -1461,9 +1778,8 @@ Cookie数量: {cookie_count}
                         else:
                             formatted_params.append(repr(param))
                     params_str = f" | 参数: [{', '.join(formatted_params)}]"
-
-        # 格式化SQL（移除多余空白）
-        formatted_sql = ' '.join(sql.split())
+            else:
+                params_str = f" | 参数: {repr(params)}"
 
         # 根据配置的日志级别输出
         log_message = f"🗄️ SQL {operation}: {formatted_sql}{params_str}"
@@ -1490,6 +1806,20 @@ Cookie数量: {cookie_count}
         self._log_sql(sql, f"批量执行 {len(params_list)} 条记录", "EXECUTEMANY")
         return cursor.executemany(sql, params_list)
     
+    def execute_query(self, sql: str, params: tuple = None):
+        """执行查询并返回结果"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
+                return cursor.fetchall()
+            except Exception as e:
+                logger.error(f"执行查询失败: {e}")
+                raise
+    
     # -------------------- Cookie操作 --------------------
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
         """保存Cookie到数据库，如存在则更新"""
@@ -1511,7 +1841,7 @@ Cookie数量: {cookie_count}
 
                 self._execute_sql(cursor,
                     "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, cookie_value, user_id)
+                    (cookie_id, self._encrypt_secret(cookie_value), user_id)
                 )
 
                 self.conn.commit()
@@ -1555,7 +1885,7 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return self._decrypt_secret(result[0]) if result else None
             except Exception as e:
                 logger.error(f"获取Cookie失败: {e}")
                 return None
@@ -1569,7 +1899,7 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
                 else:
                     self._execute_sql(cursor, "SELECT id, value FROM cookies")
-                return {row[0]: row[1] for row in cursor.fetchall()}
+                return {row[0]: self._decrypt_secret(row[1]) for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取所有Cookie失败: {e}")
                 return {}
@@ -1591,10 +1921,11 @@ Cookie数量: {cookie_count}
                 self._execute_sql(cursor, "SELECT id, value, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
+                    cookie_value = self._decrypt_secret(result[1])
                     return {
                         'id': result[0],
-                        'cookies_str': result[1],  # 使用cookies_str字段名以匹配调用方期望
-                        'value': result[1],        # 保持向后兼容
+                        'cookies_str': cookie_value,  # 使用cookies_str字段名以匹配调用方期望
+                        'value': cookie_value,        # 保持向后兼容
                         'created_at': result[2]
                     }
                 return None
@@ -1615,15 +1946,18 @@ Cookie数量: {cookie_count}
                 """, (cookie_id,))
                 result = cursor.fetchone()
                 if result:
+                    cookie_value = self._decrypt_secret(result[1])
+                    password = self._decrypt_secret(result[7])
+                    proxy_pass = self._decrypt_secret(result[14])
                     return {
                         'id': result[0],
-                        'value': result[1],
+                        'value': cookie_value,
                         'user_id': result[2],
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[6] or '',
-                        'password': result[7] or '',
+                        'password': password,
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'created_at': result[9],
                         # 代理配置
@@ -1631,7 +1965,7 @@ Cookie数量: {cookie_count}
                         'proxy_host': result[11] or '',
                         'proxy_port': result[12] or 0,
                         'proxy_user': result[13] or '',
-                        'proxy_pass': result[14] or ''
+                        'proxy_pass': proxy_pass
                     }
                 return None
             except Exception as e:
@@ -1726,7 +2060,7 @@ Cookie数量: {cookie_count}
                     
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
-                    insert_values = [cookie_id, cookie_value, user_id]
+                    insert_values = [cookie_id, self._encrypt_secret(cookie_value), user_id]
                     insert_placeholders = ['?', '?', '?']
                     
                     if username is not None:
@@ -1736,7 +2070,7 @@ Cookie数量: {cookie_count}
                     
                     if password is not None:
                         insert_fields.append('password')
-                        insert_values.append(password)
+                        insert_values.append(self._encrypt_secret(password))
                         insert_placeholders.append('?')
                     
                     if show_browser is not None:
@@ -1757,7 +2091,7 @@ Cookie数量: {cookie_count}
                     
                     if cookie_value is not None:
                         update_fields.append("value = ?")
-                        params.append(cookie_value)
+                        params.append(self._encrypt_secret(cookie_value))
                     
                     if username is not None:
                         update_fields.append("username = ?")
@@ -1765,7 +2099,7 @@ Cookie数量: {cookie_count}
                     
                     if password is not None:
                         update_fields.append("password = ?")
-                        params.append(password)
+                        params.append(self._encrypt_secret(password))
                     
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")
@@ -1833,7 +2167,7 @@ Cookie数量: {cookie_count}
                 
                 if proxy_pass is not None:
                     update_fields.append("proxy_pass = ?")
-                    params.append(proxy_pass)
+                    params.append(self._encrypt_secret(proxy_pass))
                 
                 if not update_fields:
                     logger.warning(f"更新账号 {cookie_id} 代理配置时没有提供任何更新字段")
@@ -1873,7 +2207,7 @@ Cookie数量: {cookie_count}
                         'proxy_host': result[1] or '',
                         'proxy_port': result[2] or 0,
                         'proxy_user': result[3] or '',
-                        'proxy_pass': result[4] or ''
+                        'proxy_pass': self._decrypt_secret(result[4])
                     }
                 # 返回默认配置
                 return {
@@ -2422,16 +2756,17 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 INSERT OR REPLACE INTO ai_reply_settings
-                (cookie_id, ai_enabled, model_name, api_key, base_url,
+                (cookie_id, ai_enabled, model_name, api_key, base_url, api_type,
                  max_discount_percent, max_discount_amount, max_bargain_rounds,
                  custom_prompts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     cookie_id,
                     settings.get('ai_enabled', False),
                     settings.get('model_name', 'qwen-plus'),
                     settings.get('api_key', ''),
                     settings.get('base_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
+                    settings.get('api_type', ''),
                     settings.get('max_discount_percent', 10),
                     settings.get('max_discount_amount', 100),
                     settings.get('max_bargain_rounds', 3),
@@ -2451,7 +2786,7 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT ai_enabled, model_name, api_key, base_url,
+                SELECT ai_enabled, model_name, api_key, base_url, api_type,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
                        custom_prompts
                 FROM ai_reply_settings WHERE cookie_id = ?
@@ -2464,10 +2799,11 @@ Cookie数量: {cookie_count}
                         'model_name': result[1],
                         'api_key': result[2],
                         'base_url': result[3],
-                        'max_discount_percent': result[4],
-                        'max_discount_amount': result[5],
-                        'max_bargain_rounds': result[6],
-                        'custom_prompts': result[7]
+                        'api_type': result[4] or '',
+                        'max_discount_percent': result[5],
+                        'max_discount_amount': result[6],
+                        'max_bargain_rounds': result[7],
+                        'custom_prompts': result[8]
                     }
                 else:
                     # 返回默认设置
@@ -2476,6 +2812,7 @@ Cookie数量: {cookie_count}
                         'model_name': 'qwen-plus',
                         'api_key': '',
                         'base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                        'api_type': '',
                         'max_discount_percent': 10,
                         'max_discount_amount': 100,
                         'max_bargain_rounds': 3,
@@ -2488,6 +2825,7 @@ Cookie数量: {cookie_count}
                     'model_name': 'qwen-plus',
                     'api_key': '',
                     'base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                    'api_type': '',
                     'max_discount_percent': 10,
                     'max_discount_amount': 100,
                     'max_bargain_rounds': 3,
@@ -2500,7 +2838,7 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT cookie_id, ai_enabled, model_name, api_key, base_url,
+                SELECT cookie_id, ai_enabled, model_name, api_key, base_url, api_type,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
                        custom_prompts
                 FROM ai_reply_settings
@@ -2514,10 +2852,11 @@ Cookie数量: {cookie_count}
                         'model_name': row[2],
                         'api_key': row[3],
                         'base_url': row[4],
-                        'max_discount_percent': row[5],
-                        'max_discount_amount': row[6],
-                        'max_bargain_rounds': row[7],
-                        'custom_prompts': row[8]
+                        'api_type': row[5] or '',
+                        'max_discount_percent': row[6],
+                        'max_discount_amount': row[7],
+                        'max_bargain_rounds': row[8],
+                        'custom_prompts': row[9]
                     }
 
                 return result
@@ -2526,20 +2865,21 @@ Cookie数量: {cookie_count}
                 return {}
 
     # -------------------- AI配置预设操作 --------------------
-    def save_ai_config_preset(self, user_id: int, preset_name: str, model_name: str, api_key: str = '', base_url: str = '') -> int:
+    def save_ai_config_preset(self, user_id: int, preset_name: str, model_name: str, api_key: str = '', base_url: str = '', api_type: str = '') -> int:
         """保存AI配置预设（存在则更新）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO ai_config_presets (user_id, preset_name, model_name, api_key, base_url, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO ai_config_presets (user_id, preset_name, model_name, api_key, base_url, api_type, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id, preset_name) DO UPDATE SET
                     model_name = excluded.model_name,
                     api_key = excluded.api_key,
                     base_url = excluded.base_url,
+                    api_type = excluded.api_type,
                     updated_at = CURRENT_TIMESTAMP
-                ''', (user_id, preset_name, model_name, api_key, base_url))
+                ''', (user_id, preset_name, model_name, api_key, base_url, api_type))
                 self.conn.commit()
                 preset_id = cursor.lastrowid
                 logger.debug(f"保存AI配置预设: user_id={user_id}, preset_name={preset_name}")
@@ -2554,7 +2894,7 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, preset_name, model_name, api_key, base_url, created_at, updated_at
+                SELECT id, preset_name, model_name, api_key, base_url, api_type, created_at, updated_at
                 FROM ai_config_presets
                 WHERE user_id = ?
                 ORDER BY updated_at DESC
@@ -2567,8 +2907,9 @@ Cookie数量: {cookie_count}
                         'model_name': row[2],
                         'api_key': row[3],
                         'base_url': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'api_type': row[5] or '',
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     })
                 return presets
             except Exception as e:
@@ -2758,15 +3099,21 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取通知渠道失败: {e}")
                 return []
 
-    def get_notification_channel(self, channel_id: int) -> Optional[Dict[str, any]]:
+    def get_notification_channel(self, channel_id: int, user_id: int = None) -> Optional[Dict[str, any]]:
         """获取指定通知渠道"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, name, type, config, enabled, created_at, updated_at
-                FROM notification_channels WHERE id = ?
-                ''', (channel_id,))
+                if user_id is not None:
+                    cursor.execute('''
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
+                    FROM notification_channels WHERE id = ? AND user_id = ?
+                    ''', (channel_id, user_id))
+                else:
+                    cursor.execute('''
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
+                    FROM notification_channels WHERE id = ?
+                    ''', (channel_id,))
 
                 row = cursor.fetchone()
                 if row:
@@ -2777,23 +3124,31 @@ Cookie数量: {cookie_count}
                         'config': row[3],
                         'enabled': bool(row[4]),
                         'created_at': row[5],
-                        'updated_at': row[6]
+                        'updated_at': row[6],
+                        'user_id': row[7]
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取通知渠道失败: {e}")
                 return None
 
-    def update_notification_channel(self, channel_id: int, name: str, config: str, enabled: bool = True) -> bool:
+    def update_notification_channel(self, channel_id: int, name: str, config: str, enabled: bool = True, user_id: int = None) -> bool:
         """更新通知渠道"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                UPDATE notification_channels
-                SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                ''', (name, config, enabled, channel_id))
+                if user_id is not None:
+                    cursor.execute('''
+                    UPDATE notification_channels
+                    SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                    ''', (name, config, enabled, channel_id, user_id))
+                else:
+                    cursor.execute('''
+                    UPDATE notification_channels
+                    SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''', (name, config, enabled, channel_id))
                 self.conn.commit()
                 logger.debug(f"更新通知渠道: {channel_id}")
                 return cursor.rowcount > 0
@@ -2802,12 +3157,15 @@ Cookie数量: {cookie_count}
                 self.conn.rollback()
                 return False
 
-    def delete_notification_channel(self, channel_id: int) -> bool:
+    def delete_notification_channel(self, channel_id: int, user_id: int = None) -> bool:
         """删除通知渠道"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ?", (channel_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ? AND user_id = ?", (channel_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ?", (channel_id,))
                 self.conn.commit()
                 logger.debug(f"删除通知渠道: {channel_id}")
                 return cursor.rowcount > 0
@@ -2843,7 +3201,8 @@ Cookie数量: {cookie_count}
                 SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
-                WHERE mn.cookie_id = ? AND nc.enabled = 1
+                JOIN cookies c ON mn.cookie_id = c.id
+                WHERE mn.cookie_id = ? AND nc.enabled = 1 AND nc.user_id = c.user_id
                 ORDER BY mn.id
                 ''', (cookie_id,))
 
@@ -2872,7 +3231,8 @@ Cookie数量: {cookie_count}
                 SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
-                WHERE nc.enabled = 1
+                JOIN cookies c ON mn.cookie_id = c.id
+                WHERE nc.enabled = 1 AND nc.user_id = c.user_id
                 ORDER BY mn.cookie_id, mn.id
                 ''')
 
@@ -2896,12 +3256,20 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取所有消息通知配置失败: {e}")
                 return {}
 
-    def delete_message_notification(self, notification_id: int) -> bool:
+    def delete_message_notification(self, notification_id: int, user_id: int = None) -> bool:
         """删除消息通知配置"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM message_notifications WHERE id = ?", (notification_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, '''
+                    DELETE FROM message_notifications
+                    WHERE id = ? AND channel_id IN (
+                        SELECT id FROM notification_channels WHERE user_id = ?
+                    )
+                    ''', (notification_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM message_notifications WHERE id = ?", (notification_id,))
                 self.conn.commit()
                 logger.debug(f"删除消息通知配置: {notification_id}")
                 return cursor.rowcount > 0
@@ -2910,12 +3278,20 @@ Cookie数量: {cookie_count}
                 self.conn.rollback()
                 return False
 
-    def delete_account_notifications(self, cookie_id: str) -> bool:
+    def delete_account_notifications(self, cookie_id: str, user_id: int = None) -> bool:
         """删除账号的所有消息通知配置"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM message_notifications WHERE cookie_id = ?", (cookie_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, '''
+                    DELETE FROM message_notifications
+                    WHERE cookie_id = ? AND cookie_id IN (
+                        SELECT id FROM cookies WHERE user_id = ?
+                    )
+                    ''', (cookie_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM message_notifications WHERE cookie_id = ?", (cookie_id,))
                 self.conn.commit()
                 logger.debug(f"删除账号通知配置: {cookie_id}")
                 return cursor.rowcount > 0
@@ -3649,13 +4025,13 @@ Cookie数量: {cookie_count}
     async def send_verification_email(self, email: str, code: str) -> bool:
         """发送验证码邮件（支持SMTP和API两种方式）"""
         try:
-            subject = "闲鱼自动回复系统 - 邮箱验证码"
+            subject = "闲鱼管理系统 - 邮箱验证码"
             # 使用简单的纯文本邮件内容
-            text_content = f"""【闲鱼自动回复系统】邮箱验证码
+            text_content = f"""【闲鱼管理系统】邮箱验证码
 
 您好！
 
-感谢您使用闲鱼自动回复系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
+感谢您使用闲鱼管理系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
 
 验证码：{code}
 
@@ -3665,12 +4041,11 @@ Cookie数量: {cookie_count}
 • 如非本人操作，请忽略此邮件
 • 系统不会主动索要您的验证码
 
-如果您在使用过程中遇到任何问题，请联系我们的技术支持团队。
-感谢您选择闲鱼自动回复系统！
+感谢您选择闲鱼管理系统！
 
 ---
 此邮件由系统自动发送，请勿直接回复
-© 2025 闲鱼自动回复系统"""
+© 2026 闲鱼管理系统"""
 
             # 从系统设置读取SMTP配置
             try:
@@ -3964,8 +4339,9 @@ Cookie数量: {cookie_count}
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None, spec_name_2: str = None, spec_value_2: str = None):
-        """更新卡券"""
+                   spec_value: str = None, spec_name_2: str = None, spec_value_2: str = None,
+                   user_id: int = None):
+        """更新卡券（支持用户隔离）"""
         # 调试日志
         logger.info(f"[DEBUG DB] update_card 被调用 - card_id: {card_id}")
         logger.info(f"[DEBUG DB] is_multi_spec: {is_multi_spec}, type: {type(is_multi_spec)}")
@@ -4039,7 +4415,12 @@ Cookie数量: {cookie_count}
                 update_fields.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(card_id)
 
-                sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
+                if user_id is not None:
+                    params.append(user_id)
+                    sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ? AND user_id = ?"
+                else:
+                    sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
+
                 logger.info(f"[DEBUG DB] 执行SQL: {sql}")
                 logger.info(f"[DEBUG DB] 参数: {params}")
                 self._execute_sql(cursor, sql, params)
@@ -4090,6 +4471,14 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+
+                if user_id is not None and card_id is not None:
+                    self._execute_sql(cursor, '''
+                    SELECT 1 FROM cards WHERE id = ? AND user_id = ?
+                    ''', (card_id, user_id))
+                    if not cursor.fetchone():
+                        raise ValueError(f"卡券不存在或无权限访问: {card_id}")
+
                 cursor.execute('''
                 INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -4157,28 +4546,32 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取发货规则列表失败: {e}")
                 return []
 
-    def get_delivery_rules_by_keyword(self, keyword: str, user_id: int = None):
+    def get_delivery_rules_by_keyword(self, keyword: str, user_id: int = None, only_non_multi_spec: bool = False):
         """根据关键字获取匹配的发货规则
 
         Args:
             keyword: 搜索关键字（商品标题）
             user_id: 用户ID，用于过滤只属于该用户的发货规则
+            only_non_multi_spec: 是否仅返回普通卡券规则（排除多规格卡券）
         """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                non_multi_filter = "AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)" if only_non_multi_spec else ""
                 # 使用更灵活的匹配方式：既支持商品内容包含关键字，也支持关键字包含在商品内容中
                 if user_id is not None:
-                    cursor.execute('''
+                    cursor.execute(f'''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times,
                            c.name as card_name, c.type as card_type, c.api_config,
                            c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
-                           c.delay_seconds as card_delay_seconds
+                           c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1 AND dr.user_id = ?
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    {non_multi_filter}
                     ORDER BY
                         CASE
                             WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
@@ -4187,16 +4580,18 @@ Cookie数量: {cookie_count}
                         dr.id ASC
                     ''', (user_id, keyword, keyword, keyword))
                 else:
-                    cursor.execute('''
+                    cursor.execute(f'''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times,
                            c.name as card_name, c.type as card_type, c.api_config,
                            c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
-                           c.delay_seconds as card_delay_seconds
+                           c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    {non_multi_filter}
                     ORDER BY
                         CASE
                             WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
@@ -4233,7 +4628,12 @@ Cookie数量: {cookie_count}
                         'image_url': row[12],
                         'card_enabled': bool(row[13]),
                         'card_description': row[14],  # 卡券备注信息
-                        'card_delay_seconds': row[15] or 0  # 延时秒数
+                        'card_delay_seconds': row[15] or 0,  # 延时秒数
+                        'is_multi_spec': bool(row[16]) if row[16] is not None else False,
+                        'spec_name': row[17],
+                        'spec_value': row[18],
+                        'spec_name_2': row[19],
+                        'spec_value_2': row[20]
                     })
 
                 return rules
@@ -4301,6 +4701,13 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+
+                if user_id is not None and card_id is not None:
+                    self._execute_sql(cursor, '''
+                    SELECT 1 FROM cards WHERE id = ? AND user_id = ?
+                    ''', (card_id, user_id))
+                    if not cursor.fetchone():
+                        raise ValueError(f"卡券不存在或无权限访问: {card_id}")
 
                 # 构建更新语句
                 update_fields = []
@@ -4411,8 +4818,240 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取今日发货统计失败: {e}")
                 return 0
 
+    def create_delivery_log(self, user_id: int = None, cookie_id: str = None, order_id: str = None,
+                            item_id: str = None, buyer_id: str = None, buyer_nick: str = None,
+                            rule_id: int = None, rule_keyword: str = None, card_type: str = None,
+                            match_mode: str = None, channel: str = 'auto', status: str = 'failed',
+                            reason: str = None):
+        """记录一次真实发货尝试日志（成功/失败）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO delivery_logs (
+                    user_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    rule_id, rule_keyword, card_type, match_mode, channel, status, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id if user_id is not None else 1,
+                    cookie_id,
+                    order_id,
+                    item_id,
+                    buyer_id,
+                    buyer_nick,
+                    rule_id,
+                    rule_keyword,
+                    card_type,
+                    match_mode,
+                    (channel or 'auto'),
+                    (status or 'failed'),
+                    reason
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"记录发货日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def upsert_delivery_finalization_state(self, order_id: str, unit_index: int = 1, cookie_id: str = None,
+                                           item_id: str = None, buyer_id: str = None, channel: str = 'auto',
+                                           status: str = 'sent', delivery_meta: Dict[str, Any] = None,
+                                           last_error: str = None):
+        """记录发货消息已发送但仍需 finalize 的状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                delivery_meta_json = json.dumps(delivery_meta or {}, ensure_ascii=False)
+                sent_at_value = 'CURRENT_TIMESTAMP' if status == 'sent' else 'sent_at'
+                finalized_at_value = 'CURRENT_TIMESTAMP' if status == 'finalized' else 'NULL'
+
+                self._execute_sql(cursor, f'''
+                INSERT INTO delivery_finalization_states (
+                    order_id, unit_index, cookie_id, item_id, buyer_id, channel, status, delivery_meta, last_error, sent_at, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, {finalized_at_value})
+                ON CONFLICT(order_id, unit_index) DO UPDATE SET
+                    cookie_id = excluded.cookie_id,
+                    item_id = excluded.item_id,
+                    buyer_id = excluded.buyer_id,
+                    channel = excluded.channel,
+                    status = excluded.status,
+                    delivery_meta = excluded.delivery_meta,
+                    last_error = excluded.last_error,
+                    sent_at = CASE WHEN excluded.status = 'sent' THEN CURRENT_TIMESTAMP ELSE delivery_finalization_states.sent_at END,
+                    finalized_at = CASE WHEN excluded.status = 'finalized' THEN CURRENT_TIMESTAMP ELSE delivery_finalization_states.finalized_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                ''', (order_id, unit_index, cookie_id, item_id, buyer_id, channel, status, delivery_meta_json, last_error))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"更新发货 finalize 状态失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_delivery_finalization_state(self, order_id: str, unit_index: int = 1):
+        """获取订单某个发货单元的 finalize 状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                SELECT order_id, unit_index, cookie_id, item_id, buyer_id, channel, status,
+                       delivery_meta, last_error, sent_at, finalized_at, created_at, updated_at
+                FROM delivery_finalization_states
+                WHERE order_id = ? AND unit_index = ?
+                ''', (order_id, unit_index))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                return {
+                    'order_id': row[0],
+                    'unit_index': row[1],
+                    'cookie_id': row[2],
+                    'item_id': row[3],
+                    'buyer_id': row[4],
+                    'channel': row[5],
+                    'status': row[6],
+                    'delivery_meta': json.loads(row[7] or '{}'),
+                    'last_error': row[8],
+                    'sent_at': row[9],
+                    'finalized_at': row[10],
+                    'created_at': row[11],
+                    'updated_at': row[12],
+                }
+            except Exception as e:
+                logger.error(f"获取发货 finalize 状态失败: {e}")
+                return None
+
+    def get_delivery_finalization_states(self, order_id: str):
+        """获取订单全部发货单元的 finalize 状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                SELECT order_id, unit_index, cookie_id, item_id, buyer_id, channel, status,
+                       delivery_meta, last_error, sent_at, finalized_at, created_at, updated_at
+                FROM delivery_finalization_states
+                WHERE order_id = ?
+                ORDER BY unit_index ASC
+                ''', (order_id,))
+
+                states = []
+                for row in cursor.fetchall():
+                    states.append({
+                        'order_id': row[0],
+                        'unit_index': row[1],
+                        'cookie_id': row[2],
+                        'item_id': row[3],
+                        'buyer_id': row[4],
+                        'channel': row[5],
+                        'status': row[6],
+                        'delivery_meta': json.loads(row[7] or '{}'),
+                        'last_error': row[8],
+                        'sent_at': row[9],
+                        'finalized_at': row[10],
+                        'created_at': row[11],
+                        'updated_at': row[12],
+                    })
+                return states
+            except Exception as e:
+                logger.error(f"获取订单全部发货 finalize 状态失败: {e}")
+                return []
+
+    def get_delivery_progress_summary(self, order_id: str, expected_quantity: int = 1):
+        """汇总订单的多数量发货进度。"""
+        try:
+            expected = max(1, int(expected_quantity or 1))
+        except (TypeError, ValueError):
+            expected = 1
+
+        states = self.get_delivery_finalization_states(order_id)
+        state_by_unit = {}
+        for state in states:
+            try:
+                unit_index = max(1, int(state.get('unit_index') or 1))
+            except (TypeError, ValueError):
+                unit_index = 1
+            state_by_unit[unit_index] = state
+
+        finalized_unit_indexes = []
+        pending_finalize_unit_indexes = []
+        remaining_unit_indexes = []
+
+        for unit_index in range(1, expected + 1):
+            status = (state_by_unit.get(unit_index) or {}).get('status')
+            if status == 'finalized':
+                finalized_unit_indexes.append(unit_index)
+            elif status == 'sent':
+                pending_finalize_unit_indexes.append(unit_index)
+            else:
+                remaining_unit_indexes.append(unit_index)
+
+        if pending_finalize_unit_indexes:
+            aggregate_status = 'partial_pending_finalize'
+        elif len(finalized_unit_indexes) >= expected:
+            aggregate_status = 'shipped'
+        elif finalized_unit_indexes:
+            aggregate_status = 'partial_success'
+        else:
+            aggregate_status = 'pending_ship'
+
+        return {
+            'order_id': order_id,
+            'expected_quantity': expected,
+            'state_count': len(states),
+            'finalized_count': len(finalized_unit_indexes),
+            'pending_finalize_count': len(pending_finalize_unit_indexes),
+            'remaining_count': len(remaining_unit_indexes),
+            'finalized_unit_indexes': finalized_unit_indexes,
+            'pending_finalize_unit_indexes': pending_finalize_unit_indexes,
+            'remaining_unit_indexes': remaining_unit_indexes,
+            'aggregate_status': aggregate_status,
+            'states': states,
+        }
+
+    def get_recent_delivery_logs(self, user_id: int, limit: int = 20):
+        """获取最近发货日志（按用户隔离）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                safe_limit = max(1, min(int(limit), 200))
+                cursor.execute('''
+                SELECT id, user_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                       rule_id, rule_keyword, card_type, match_mode, channel, status, reason, created_at
+                FROM delivery_logs
+                WHERE user_id = ?
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                ''', (user_id, safe_limit))
+
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'id': row[0],
+                        'user_id': row[1],
+                        'cookie_id': row[2],
+                        'order_id': row[3],
+                        'item_id': row[4],
+                        'buyer_id': row[5],
+                        'buyer_nick': row[6],
+                        'rule_id': row[7],
+                        'rule_keyword': row[8],
+                        'card_type': row[9],
+                        'match_mode': row[10],
+                        'channel': row[11],
+                        'status': row[12],
+                        'reason': row[13],
+                        'created_at': row[14]
+                    })
+                return logs
+            except Exception as e:
+                logger.error(f"获取最近发货日志失败: {e}")
+                return []
+
     def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None,
-                                               spec_name_2: str = None, spec_value_2: str = None, user_id: int = None):
+                                               spec_name_2: str = None, spec_value_2: str = None, user_id: int = None,
+                                               expected_mode: str = None):
         """根据关键字和规格信息获取匹配的发货规则（支持双规格）
 
         Args:
@@ -4422,6 +5061,7 @@ Cookie数量: {cookie_count}
             spec_name_2: 规格2名称
             spec_value_2: 规格2值
             user_id: 用户ID，用于过滤只属于该用户的发货规则
+            expected_mode: 期望规则模式，可选 one_spec 或 two_spec
         """
         with self.lock:
             try:
@@ -4430,120 +5070,92 @@ Cookie数量: {cookie_count}
                 # 构建user_id过滤条件
                 user_filter = "AND dr.user_id = ?" if user_id is not None else ""
 
-                # 优先匹配：卡券名称+规格1+规格2（如果都有的话）
-                if spec_name and spec_value:
-                    # 构建匹配条件：规格1必须匹配，规格2如果订单有则必须匹配，如果订单没有则卡券也不能有
-                    if spec_name_2 and spec_value_2:
-                        # 订单有双规格，卡券也必须有双规格且都匹配
-                        sql = f'''
-                        SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
-                               dr.description, dr.delivery_times,
-                               c.name as card_name, c.type as card_type, c.api_config,
-                               c.text_content, c.data_content, c.enabled as card_enabled,
-                               c.description as card_description, c.delay_seconds as card_delay_seconds,
-                               c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
-                        FROM delivery_rules dr
-                        LEFT JOIN cards c ON dr.card_id = c.id
-                        WHERE dr.enabled = 1 AND c.enabled = 1 {user_filter}
-                        AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                        AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
-                        AND c.spec_name_2 = ? AND c.spec_value_2 = ?
-                        ORDER BY
-                            CASE
-                                WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                                ELSE LENGTH(dr.keyword) / 2
-                            END DESC,
-                            dr.delivery_times ASC
-                        '''
-                        params = [user_id, keyword, keyword, spec_name, spec_value, spec_name_2, spec_value_2, keyword] if user_id is not None else [keyword, keyword, spec_name, spec_value, spec_name_2, spec_value_2, keyword]
-                        cursor.execute(sql, [p for p in params if p is not None or user_id is None])
+                def _normalize_spec_for_match(value: str) -> str:
+                    """规格匹配标准化：忽略大小写、前后空白、半角/全角空格差异。"""
+                    if value is None:
+                        return ''
+                    return str(value).strip().lower().replace(' ', '').replace('　', '')
+
+                normalized_spec_name = _normalize_spec_for_match(spec_name)
+                normalized_spec_value = _normalize_spec_for_match(spec_value)
+                normalized_spec_name_2 = _normalize_spec_for_match(spec_name_2)
+                normalized_spec_value_2 = _normalize_spec_for_match(spec_value_2)
+
+                if not normalized_spec_name or not normalized_spec_value:
+                    logger.info(f"规格参数不完整，跳过规格匹配: {keyword}")
+                    return []
+
+                if expected_mode is None:
+                    expected_mode = 'two_spec' if (normalized_spec_name_2 and normalized_spec_value_2) else 'one_spec'
+
+                if expected_mode not in {'one_spec', 'two_spec'}:
+                    logger.warning(f"未知的规格匹配模式: {expected_mode}")
+                    return []
+
+                if expected_mode == 'two_spec':
+                    if not (normalized_spec_name_2 and normalized_spec_value_2):
+                        logger.info(f"期望两组规格匹配但订单规格不完整: {keyword}")
+                        return []
+
+                    sql = f'''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.enabled as card_enabled,
+                           c.description as card_description, c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1 {user_filter}
+                    AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    AND c.is_multi_spec = 1
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_name, ''))), ' ', ''), '　', '') = ?
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_value, ''))), ' ', ''), '　', '') = ?
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_name_2, ''))), ' ', ''), '　', '') = ?
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_value_2, ''))), ' ', ''), '　', '') = ?
+                    ORDER BY
+                        CASE
+                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
+                            ELSE LENGTH(dr.keyword) / 2
+                        END DESC,
+                        dr.delivery_times ASC
+                    '''
+                    if user_id is not None:
+                        params = [user_id, keyword, keyword, normalized_spec_name, normalized_spec_value,
+                                  normalized_spec_name_2, normalized_spec_value_2, keyword]
                     else:
-                        # 订单只有单规格，优先匹配只有单规格的卡券
-                        sql = f'''
-                        SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
-                               dr.description, dr.delivery_times,
-                               c.name as card_name, c.type as card_type, c.api_config,
-                               c.text_content, c.data_content, c.enabled as card_enabled,
-                               c.description as card_description, c.delay_seconds as card_delay_seconds,
-                               c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
-                        FROM delivery_rules dr
-                        LEFT JOIN cards c ON dr.card_id = c.id
-                        WHERE dr.enabled = 1 AND c.enabled = 1 {user_filter}
-                        AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                        AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
-                        AND (c.spec_name_2 IS NULL OR c.spec_name_2 = '')
-                        ORDER BY
-                            CASE
-                                WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                                ELSE LENGTH(dr.keyword) / 2
-                            END DESC,
-                            dr.delivery_times ASC
-                        '''
-                        params = [user_id, keyword, keyword, spec_name, spec_value, keyword] if user_id is not None else [keyword, keyword, spec_name, spec_value, keyword]
-                        cursor.execute(sql, [p for p in params if p is not None or user_id is None])
+                        params = [keyword, keyword, normalized_spec_name, normalized_spec_value,
+                                  normalized_spec_name_2, normalized_spec_value_2, keyword]
+                else:
+                    sql = f'''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.enabled as card_enabled,
+                           c.description as card_description, c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1 {user_filter}
+                    AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    AND c.is_multi_spec = 1
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_name, ''))), ' ', ''), '　', '') = ?
+                    AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(c.spec_value, ''))), ' ', ''), '　', '') = ?
+                    AND TRIM(COALESCE(c.spec_name_2, '')) = ''
+                    AND TRIM(COALESCE(c.spec_value_2, '')) = ''
+                    ORDER BY
+                        CASE
+                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
+                            ELSE LENGTH(dr.keyword) / 2
+                        END DESC,
+                        dr.delivery_times ASC
+                    '''
+                    if user_id is not None:
+                        params = [user_id, keyword, keyword, normalized_spec_name, normalized_spec_value, keyword]
+                    else:
+                        params = [keyword, keyword, normalized_spec_name, normalized_spec_value, keyword]
 
-                    rules = []
-                    for row in cursor.fetchall():
-                        # 解析api_config JSON字符串
-                        api_config = row[9]
-                        if api_config:
-                            try:
-                                import json
-                                api_config = json.loads(api_config)
-                            except (json.JSONDecodeError, TypeError):
-                                # 如果解析失败，保持原始字符串
-                                pass
-
-                        rules.append({
-                            'id': row[0],
-                            'keyword': row[1],
-                            'card_id': row[2],
-                            'delivery_count': row[3],
-                            'enabled': bool(row[4]),
-                            'description': row[5],
-                            'delivery_times': row[6] or 0,
-                            'card_name': row[7],
-                            'card_type': row[8],
-                            'api_config': api_config,
-                            'text_content': row[10],
-                            'data_content': row[11],
-                            'card_enabled': bool(row[12]),
-                            'card_description': row[13],
-                            'card_delay_seconds': row[14] or 0,
-                            'is_multi_spec': bool(row[15]),
-                            'spec_name': row[16],
-                            'spec_value': row[17],
-                            'spec_name_2': row[18],
-                            'spec_value_2': row[19]
-                        })
-
-                    if rules:
-                        if spec_name_2 and spec_value_2:
-                            logger.info(f"找到双规格匹配规则: {keyword} - {spec_name}:{spec_value}, {spec_name_2}:{spec_value_2}")
-                        else:
-                            logger.info(f"找到单规格匹配规则: {keyword} - {spec_name}:{spec_value}")
-                        return rules
-
-                # 兜底匹配：仅卡券名称
-                cursor.execute('''
-                SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
-                       dr.description, dr.delivery_times,
-                       c.name as card_name, c.type as card_type, c.api_config,
-                       c.text_content, c.data_content, c.enabled as card_enabled,
-                       c.description as card_description, c.delay_seconds as card_delay_seconds,
-                       c.is_multi_spec, c.spec_name, c.spec_value, c.spec_name_2, c.spec_value_2
-                FROM delivery_rules dr
-                LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
-                AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
-                ORDER BY
-                    CASE
-                        WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                        ELSE LENGTH(dr.keyword) / 2
-                    END DESC,
-                    dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                cursor.execute(sql, params)
 
                 rules = []
                 for row in cursor.fetchall():
@@ -4581,9 +5193,15 @@ Cookie数量: {cookie_count}
                     })
 
                 if rules:
-                    logger.info(f"找到兜底匹配规则: {keyword}")
+                    if expected_mode == 'two_spec':
+                        logger.info(f"找到两组规格匹配规则: {keyword} - {spec_name}:{spec_value}, {spec_name_2}:{spec_value_2}")
+                    else:
+                        logger.info(f"找到一组规格匹配规则: {keyword} - {spec_name}:{spec_value}")
                 else:
-                    logger.info(f"未找到匹配规则: {keyword}")
+                    if expected_mode == 'two_spec':
+                        logger.info(f"未找到两组规格匹配规则: {keyword}")
+                    else:
+                        logger.info(f"未找到一组规格匹配规则: {keyword}")
 
                 return rules
 
@@ -4591,16 +5209,19 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取发货规则失败: {e}")
                 return []
 
-    def delete_card(self, card_id: int):
-        """删除卡券"""
+    def delete_card(self, card_id: int, user_id: int = None):
+        """删除卡券（支持用户隔离）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
-                    logger.info(f"删除卡券成功: ID {card_id}")
+                    logger.info(f"删除卡券成功: ID {card_id} (用户ID: {user_id})")
                     return True
                 else:
                     return False  # 没有找到对应的记录
@@ -4631,6 +5252,290 @@ Cookie数量: {cookie_count}
                 logger.error(f"删除发货规则失败: {e}")
                 self.conn.rollback()
                 raise
+
+    def reserve_batch_data(self, card_id: int, order_id: str, unit_index: int = 1,
+                           cookie_id: str = None, buyer_id: str = None, ttl_minutes: int = 30):
+        """原子预占一条批量数据，避免并发订单读取到同一条卡密。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                SELECT id, card_id, order_id, cookie_id, buyer_id, unit_index, reserved_content, status,
+                       last_error, created_at, updated_at, sent_at, finalized_at, released_at, expires_at
+                FROM data_card_reservations
+                WHERE card_id = ? AND order_id = ? AND unit_index = ?
+                  AND status IN ('reserved', 'sent', 'consumed')
+                ORDER BY id DESC LIMIT 1
+                ''', (card_id, order_id, unit_index))
+                existing = cursor.fetchone()
+                if existing:
+                    logger.info(f"复用批量数据预占记录: card_id={card_id}, order_id={order_id}, unit_index={unit_index}, status={existing[7]}")
+                    return {
+                        'id': existing[0],
+                        'card_id': existing[1],
+                        'order_id': existing[2],
+                        'cookie_id': existing[3],
+                        'buyer_id': existing[4],
+                        'unit_index': existing[5],
+                        'reserved_content': existing[6],
+                        'status': existing[7],
+                        'last_error': existing[8],
+                        'created_at': existing[9],
+                        'updated_at': existing[10],
+                        'sent_at': existing[11],
+                        'finalized_at': existing[12],
+                        'released_at': existing[13],
+                        'expires_at': existing[14],
+                    }
+
+                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                result = cursor.fetchone()
+                if not result or not result[0]:
+                    logger.warning(f"卡券 {card_id} 没有可预占的批量数据")
+                    return None
+
+                lines = [line.strip() for line in str(result[0]).split('\n') if line.strip()]
+                if not lines:
+                    logger.warning(f"卡券 {card_id} 批量数据为空，无法预占")
+                    return None
+
+                reserved_content = lines.pop(0)
+                remaining_content = '\n'.join(lines)
+
+                self._execute_sql(cursor, '''
+                UPDATE cards
+                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (remaining_content, card_id))
+
+                self._execute_sql(cursor, '''
+                INSERT INTO data_card_reservations (
+                    card_id, order_id, cookie_id, buyer_id, unit_index, reserved_content, status, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', datetime('now', ?))
+                ''', (card_id, order_id, cookie_id, buyer_id, unit_index, reserved_content, f'+{int(ttl_minutes)} minutes'))
+
+                reservation_id = cursor.lastrowid
+                self.conn.commit()
+                logger.info(f"批量数据预占成功: card_id={card_id}, order_id={order_id}, unit_index={unit_index}, reservation_id={reservation_id}")
+                return {
+                    'id': reservation_id,
+                    'card_id': card_id,
+                    'order_id': order_id,
+                    'cookie_id': cookie_id,
+                    'buyer_id': buyer_id,
+                    'unit_index': unit_index,
+                    'reserved_content': reserved_content,
+                    'status': 'reserved',
+                }
+            except Exception as e:
+                logger.error(f"预占批量数据失败: card_id={card_id}, order_id={order_id}, error={e}")
+                self.conn.rollback()
+                return None
+
+    def mark_batch_data_reservation_sent(self, reservation_id: int):
+        """标记预占卡密已发送成功。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT status FROM data_card_reservations WHERE id = ?", (reservation_id,))
+                result = cursor.fetchone()
+                if not result:
+                    return False
+
+                current_status = result[0]
+                if current_status in ('sent', 'consumed'):
+                    return True
+                if current_status != 'reserved':
+                    logger.warning(f"批量数据预占状态不允许标记为已发送: reservation_id={reservation_id}, status={current_status}")
+                    return False
+
+                self._execute_sql(cursor, '''
+                UPDATE data_card_reservations
+                SET status = 'sent', sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, expires_at = NULL
+                WHERE id = ?
+                ''', (reservation_id,))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"标记批量数据预占已发送失败: reservation_id={reservation_id}, error={e}")
+                self.conn.rollback()
+                return False
+
+    def finalize_batch_data_reservation(self, reservation_id: int):
+        """完成批量数据预占，进入 consumed 状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT status FROM data_card_reservations WHERE id = ?", (reservation_id,))
+                result = cursor.fetchone()
+                if not result:
+                    return {'success': False, 'already_finalized': False}
+
+                current_status = result[0]
+                if current_status == 'consumed':
+                    return {'success': True, 'already_finalized': True}
+                if current_status not in ('reserved', 'sent'):
+                    logger.warning(f"批量数据预占状态不允许 finalize: reservation_id={reservation_id}, status={current_status}")
+                    return {'success': False, 'already_finalized': False}
+
+                self._execute_sql(cursor, '''
+                UPDATE data_card_reservations
+                SET status = 'consumed', finalized_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, expires_at = NULL
+                WHERE id = ?
+                ''', (reservation_id,))
+                self.conn.commit()
+                return {'success': True, 'already_finalized': False}
+            except Exception as e:
+                logger.error(f"完成批量数据预占失败: reservation_id={reservation_id}, error={e}")
+                self.conn.rollback()
+                return {'success': False, 'already_finalized': False}
+
+    def release_batch_data_reservation(self, reservation_id: int, error: str = None, expired: bool = False):
+        """释放未发送成功的预占卡密并回滚到卡池头部。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                SELECT card_id, reserved_content, status
+                FROM data_card_reservations
+                WHERE id = ?
+                ''', (reservation_id,))
+                result = cursor.fetchone()
+                if not result:
+                    return False
+
+                card_id, reserved_content, current_status = result
+                if current_status in ('released', 'expired'):
+                    return True
+                if current_status in ('sent', 'consumed'):
+                    logger.warning(f"批量数据预占已发送或已完成，不能释放: reservation_id={reservation_id}, status={current_status}")
+                    return False
+
+                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                card_row = cursor.fetchone()
+                current_content = card_row[0] if card_row and card_row[0] else ''
+                new_content = reserved_content if not current_content else f"{reserved_content}\n{current_content}"
+
+                self._execute_sql(cursor, '''
+                UPDATE cards
+                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (new_content, card_id))
+
+                next_status = 'expired' if expired else 'released'
+                self._execute_sql(cursor, '''
+                UPDATE data_card_reservations
+                SET status = ?, last_error = ?, released_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, expires_at = NULL
+                WHERE id = ?
+                ''', (next_status, error, reservation_id))
+                self.conn.commit()
+                logger.info(f"释放批量数据预占成功: reservation_id={reservation_id}, status={next_status}")
+                return True
+            except Exception as e:
+                logger.error(f"释放批量数据预占失败: reservation_id={reservation_id}, error={e}")
+                self.conn.rollback()
+                return False
+
+    def recover_stale_batch_data_reservations(self, ttl_minutes: int = 30):
+        """恢复超时未发送的批量数据预占。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                SELECT id FROM data_card_reservations
+                WHERE status = 'reserved'
+                  AND datetime(created_at) <= datetime('now', ?)
+                ORDER BY id ASC
+                ''', (f'-{int(ttl_minutes)} minutes',))
+                stale_ids = [row[0] for row in cursor.fetchall()]
+
+                recovered = 0
+                for reservation_id in stale_ids:
+                    if self.release_batch_data_reservation(reservation_id, error='预占超时自动回收', expired=True):
+                        recovered += 1
+
+                if recovered:
+                    logger.info(f"恢复超时批量数据预占完成: {recovered} 条")
+                return recovered
+            except Exception as e:
+                logger.error(f"恢复超时批量数据预占失败: {e}")
+                return 0
+
+    def peek_batch_data(self, card_id: int, line_index: int = 0):
+        """预览批量数据指定位置的记录，不执行消费。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                result = cursor.fetchone()
+
+                if not result or not result[0]:
+                    logger.warning(f"卡券 {card_id} 没有批量数据")
+                    return None
+
+                data_content = result[0]
+                lines = [line.strip() for line in data_content.split('\n') if line.strip()]
+                if not lines:
+                    logger.warning(f"卡券 {card_id} 批量数据为空")
+                    return None
+
+                if line_index < 0 or line_index >= len(lines):
+                    logger.warning(f"卡券 {card_id} 预览索引越界: index={line_index}, total={len(lines)}")
+                    return None
+
+                logger.info(f"预览批量数据成功: 卡券ID={card_id}, index={line_index}, 剩余={len(lines)}条")
+                return lines[line_index]
+            except Exception as e:
+                logger.error(f"预览批量数据失败: {e}")
+                return None
+
+    def consume_specific_batch_data(self, card_id: int, expected_line: str):
+        """仅当第一条记录与预期一致时消费批量数据，避免误删其他卡密。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                result = cursor.fetchone()
+
+                if not result or not result[0]:
+                    logger.warning(f"卡券 {card_id} 没有批量数据，无法消费指定记录")
+                    return False
+
+                data_content = result[0]
+                lines = [line.strip() for line in data_content.split('\n') if line.strip()]
+                if not lines:
+                    logger.warning(f"卡券 {card_id} 批量数据为空，无法消费指定记录")
+                    return False
+
+                first_line = lines[0]
+                expected_line = (expected_line or '').strip()
+                if not expected_line:
+                    logger.warning(f"卡券 {card_id} 缺少预期批量数据内容，拒绝消费")
+                    return False
+
+                if first_line != expected_line:
+                    logger.warning(
+                        f"卡券 {card_id} 批量数据首条与预期不一致，拒绝消费: "
+                        f"expected={expected_line!r}, actual={first_line!r}"
+                    )
+                    return False
+
+                remaining_lines = lines[1:]
+                new_data_content = '\n'.join(remaining_lines)
+
+                self._execute_sql(cursor, '''
+                UPDATE cards
+                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (new_data_content, card_id))
+
+                self.conn.commit()
+                logger.info(f"消费指定批量数据成功: 卡券ID={card_id}, 剩余={len(remaining_lines)}条")
+                return True
+            except Exception as e:
+                logger.error(f"消费指定批量数据失败: {e}")
+                self.conn.rollback()
+                return False
 
     def consume_batch_data(self, card_id: int):
         """消费批量数据的第一条记录（线程安全）"""
@@ -5620,11 +6525,21 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取表数据失败: {table_name} - {e}")
                 return [], []
 
+    # 已知的无效 buyer_id 占位值
+    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null"}
+
+    @staticmethod
+    def _is_valid_buyer_id(buyer_id) -> bool:
+        """检查 buyer_id 是否为有效值（非占位符）"""
+        if not buyer_id:
+            return False
+        return str(buyer_id).strip() not in DBManager._INVALID_BUYER_IDS
+
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               sid: str = None, spec_name_2: str = None, spec_value_2: str = None,
-                              buyer_nick: str = None):
+                              buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False):
         """插入或更新订单信息
 
         Args:
@@ -5645,6 +6560,11 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                normalized_order_status = self._normalize_order_status(order_status)
+                has_pre_refund_status = pre_refund_status is not ...
+                normalized_pre_refund_status = None
+                if has_pre_refund_status:
+                    normalized_pre_refund_status = self._normalize_order_status(pre_refund_status)
 
                 # 检查cookie_id是否在cookies表中存在（如果提供了cookie_id）
                 if cookie_id:
@@ -5667,8 +6587,11 @@ Cookie数量: {cookie_count}
                         update_fields.append("item_id = ?")
                         update_values.append(item_id)
                     if buyer_id is not None:
-                        update_fields.append("buyer_id = ?")
-                        update_values.append(buyer_id)
+                        if self._is_valid_buyer_id(buyer_id):
+                            update_fields.append("buyer_id = ?")
+                            update_values.append(buyer_id)
+                        else:
+                            logger.debug(f"跳过无效buyer_id覆盖: order_id={order_id}, invalid_buyer_id={buyer_id}")
                     if buyer_nick is not None:
                         update_fields.append("buyer_nick = ?")
                         update_values.append(buyer_nick)
@@ -5695,7 +6618,12 @@ Cookie数量: {cookie_count}
                         update_values.append(amount)
                     if order_status is not None:
                         update_fields.append("order_status = ?")
-                        update_values.append(order_status)
+                        update_values.append(normalized_order_status or 'unknown')
+                    if clear_pre_refund_status:
+                        update_fields.append("pre_refund_status = NULL")
+                    elif has_pre_refund_status:
+                        update_fields.append("pre_refund_status = ?")
+                        update_values.append(normalized_pre_refund_status)
                     if cookie_id is not None:
                         update_fields.append("cookie_id = ?")
                         update_values.append(cookie_id)
@@ -5708,13 +6636,24 @@ Cookie数量: {cookie_count}
                         cursor.execute(sql, update_values)
                         logger.info(f"更新订单信息: {order_id}")
                 else:
-                    # 插入新订单
-                    cursor.execute('''
-                    INSERT INTO orders (order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                                      spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                          spec_name_2, spec_value_2, quantity, amount, order_status or 'unknown', cookie_id))
+                    # 插入新订单时，净化无效 buyer_id
+                    sanitized_buyer_id = buyer_id if self._is_valid_buyer_id(buyer_id) else None
+                    insert_fields = [
+                        'order_id', 'item_id', 'buyer_id', 'buyer_nick', 'sid', 'spec_name', 'spec_value',
+                        'spec_name_2', 'spec_value_2', 'quantity', 'amount', 'order_status', 'cookie_id'
+                    ]
+                    insert_values = [
+                        order_id, item_id, sanitized_buyer_id, buyer_nick, sid, spec_name, spec_value,
+                        spec_name_2, spec_value_2, quantity, amount, normalized_order_status or 'unknown', cookie_id
+                    ]
+
+                    if has_pre_refund_status and not clear_pre_refund_status:
+                        insert_fields.append('pre_refund_status')
+                        insert_values.append(normalized_pre_refund_status)
+
+                    insert_placeholders = ', '.join(['?'] * len(insert_fields))
+                    sql = f"INSERT INTO orders ({', '.join(insert_fields)}) VALUES ({insert_placeholders})"
+                    cursor.execute(sql, insert_values)
                     logger.info(f"插入新订单: {order_id}")
 
                 self.conn.commit()
@@ -5732,7 +6671,7 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, order_status, pre_refund_status, cookie_id, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -5751,14 +6690,29 @@ Cookie数量: {cookie_count}
                         'quantity': row[9],
                         'amount': row[10],
                         'order_status': row[11],
-                        'cookie_id': row[12],
-                        'created_at': row[13],
-                        'updated_at': row[14]
+                        'pre_refund_status': row[12],
+                        'cookie_id': row[13],
+                        'created_at': row[14],
+                        'updated_at': row[15]
                     }
                 return None
 
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")
+                return None
+
+    def get_order_pre_refund_status(self, order_id: str) -> str:
+        """获取订单退款前状态，用于退款撤销时跨重启回退。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT pre_refund_status FROM orders WHERE order_id = ?", (order_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return self._normalize_order_status(row[0]) if row[0] else None
+            except Exception as e:
+                logger.error(f"获取订单退款前状态失败: {order_id} - {e}")
                 return None
 
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
@@ -5798,6 +6752,28 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
                 return []
 
+    def delete_order(self, order_id: str, cookie_id: str = None) -> bool:
+        """删除订单，可选限定所属账号。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if cookie_id is not None:
+                    cursor.execute("DELETE FROM orders WHERE order_id = ? AND cookie_id = ?", (order_id, cookie_id))
+                else:
+                    cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    logger.info(f"删除订单成功: {order_id}")
+                    return True
+
+                logger.warning(f"删除订单失败，订单不存在或无权限: {order_id}")
+                return False
+            except Exception as e:
+                logger.error(f"删除订单失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
     def update_buyer_nick_by_buyer_id(self, buyer_id: str, buyer_nick: str, cookie_id: str = None):
         """根据买家ID更新所有相关订单的买家昵称
 
@@ -5822,12 +6798,12 @@ Cookie数量: {cookie_count}
                 # 更新该买家所有订单的昵称（允许覆盖已有值）
                 if cookie_id:
                     cursor.execute('''
-                    UPDATE orders SET buyer_nick = ?, updated_at = CURRENT_TIMESTAMP
+                    UPDATE orders SET buyer_nick = ?
                     WHERE buyer_id = ? AND cookie_id = ?
                     ''', (buyer_nick, buyer_id, cookie_id))
                 else:
                     cursor.execute('''
-                    UPDATE orders SET buyer_nick = ?, updated_at = CURRENT_TIMESTAMP
+                    UPDATE orders SET buyer_nick = ?
                     WHERE buyer_id = ?
                     ''', (buyer_nick, buyer_id))
 
@@ -5869,8 +6845,14 @@ Cookie数量: {cookie_count}
                     params.append(cookie_id)
                 
                 if status:
-                    conditions.append("order_status = ?")
-                    params.append(status)
+                    normalized_status = self._normalize_order_status(status) or status
+                    # 兼容历史数据：待发货状态可能仍保留为 pending_delivery
+                    if normalized_status == 'pending_ship':
+                        conditions.append("(order_status = ? OR order_status = ? OR order_status = ? OR order_status = ?)")
+                        params.extend(['pending_ship', 'pending_delivery', 'partial_success', 'partial_pending_finalize'])
+                    else:
+                        conditions.append("order_status = ?")
+                        params.append(normalized_status)
                 
                 # 添加时间限制
                 conditions.append("datetime(created_at) >= datetime('now', ?)")
@@ -5924,7 +6906,7 @@ Cookie数量: {cookie_count}
         Args:
             sid: 会话ID（如 56226853668@goofish 或 56226853668）
             cookie_id: Cookie ID（可选，用于限定账号）
-            status: 订单状态过滤（可选，如'processing'）
+            status: 订单状态过滤（可选，如'pending_ship'）
             minutes: 查询最近多少分钟内的订单，默认10分钟
         
         Returns:
@@ -5947,10 +6929,16 @@ Cookie数量: {cookie_count}
                     params.append(cookie_id)
                 
                 if status:
-                    conditions.append("order_status != 'shipped' ")
+                    normalized_status = self._normalize_order_status(status) or status
+                    if normalized_status == 'pending_ship':
+                        conditions.append("(order_status = ? OR order_status = ? OR order_status = ? OR order_status = ?)")
+                        params.extend(['pending_ship', 'pending_delivery', 'partial_success', 'partial_pending_finalize'])
+                    else:
+                        conditions.append("order_status = ?")
+                        params.append(normalized_status)
                 
                 # 添加时间限制
-                conditions.append("datetime(created_at) >= datetime('now', ?)")
+                conditions.append("datetime(COALESCE(updated_at, created_at)) >= datetime('now', ?)")
                 params.append(f'-{minutes} minutes')
                 
                 where_clause = " AND ".join(conditions)
@@ -5960,7 +6948,7 @@ Cookie数量: {cookie_count}
                        spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
                 FROM orders
                 WHERE {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY datetime(COALESCE(updated_at, created_at)) DESC
                 LIMIT 1
                 '''
 
@@ -6005,6 +6993,115 @@ Cookie数量: {cookie_count}
                 logger.error(f"根据sid获取订单失败: sid={sid} - {e}")
                 return None
 
+    def find_recent_orders_by_match_context(self, sid: str = None, buyer_id: str = None, item_id: str = None,
+                                            cookie_id: str = None, statuses: List[str] = None,
+                                            exclude_order_id: str = None, minutes: int = 30, limit: int = 10):
+        """根据会话/买家/商品匹配键获取最近订单列表。
+
+        主要用于同一 sid 下短时间连续产生多个订单号时，做更稳妥的状态回填。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                conditions = []
+                params = []
+
+                if sid:
+                    sid_clean = sid.split('@')[0] if '@' in sid else sid
+                    conditions.append("(sid = ? OR sid = ? OR sid LIKE ?)")
+                    params.extend([sid, sid_clean, f"{sid_clean}@%"])
+
+                if buyer_id:
+                    conditions.append("buyer_id = ?")
+                    params.append(buyer_id)
+
+                if item_id:
+                    conditions.append("item_id = ?")
+                    params.append(item_id)
+
+                if cookie_id:
+                    conditions.append("cookie_id = ?")
+                    params.append(cookie_id)
+
+                if exclude_order_id:
+                    conditions.append("order_id != ?")
+                    params.append(exclude_order_id)
+
+                if statuses:
+                    normalized_statuses = []
+                    for status in statuses:
+                        normalized_status = self._normalize_order_status(status) or status
+                        if normalized_status not in normalized_statuses:
+                            normalized_statuses.append(normalized_status)
+
+                    if normalized_statuses:
+                        placeholders = ",".join(["?"] * len(normalized_statuses))
+                        conditions.append(f"order_status IN ({placeholders})")
+                        params.extend(normalized_statuses)
+
+                if not conditions:
+                    logger.warning("find_recent_orders_by_match_context 缺少有效查询条件，拒绝全表扫描")
+                    return []
+
+                conditions.append("datetime(COALESCE(updated_at, created_at)) >= datetime('now', ?)")
+                params.append(f'-{minutes} minutes')
+
+                sql = f'''
+                SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
+                       spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
+                FROM orders
+                WHERE {" AND ".join(conditions)}
+                ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, created_at DESC
+                LIMIT ?
+                '''
+                params.append(limit)
+
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                if not rows:
+                    logger.info(
+                        "根据匹配键未找到最近订单: "
+                        f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, "
+                        f"cookie_id={cookie_id}, statuses={statuses}, minutes={minutes}"
+                    )
+                    return []
+
+                logger.info(
+                    "根据匹配键找到最近订单: "
+                    f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, "
+                    f"count={len(rows)}, statuses={statuses}, minutes={minutes}"
+                )
+
+                orders = []
+                for row in rows:
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'spec_name': row[5],
+                        'spec_value': row[6],
+                        'spec_name_2': row[7],
+                        'spec_value_2': row[8],
+                        'quantity': row[9],
+                        'amount': row[10],
+                        'order_status': row[11],
+                        'cookie_id': row[12],
+                        'created_at': row[13],
+                        'updated_at': row[14],
+                    })
+
+                return orders
+
+            except Exception as e:
+                logger.error(
+                    "根据匹配键获取最近订单失败: "
+                    f"sid={sid}, buyer_id={buyer_id}, item_id={item_id}, error={e}"
+                )
+                return []
+
     def update_order_yifan_status(self, order_id: str, yifan_orderno: str = None,
                                   delivery_status: str = None, callback_data: str = None):
         """
@@ -6024,10 +7121,12 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 
                 # 首先检查订单是否存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
-                if not cursor.fetchone():
+                cursor.execute("SELECT order_id, order_status FROM orders WHERE order_id = ?", (order_id,))
+                existing_order = cursor.fetchone()
+                if not existing_order:
                     logger.warning(f"订单不存在: {order_id}")
                     return False
+                current_order_status = existing_order[1] if len(existing_order) > 1 else None
                 
                 # 检查是否存在yifan相关字段，如果不存在则添加
                 try:
@@ -6053,9 +7152,16 @@ Cookie数量: {cookie_count}
                 if delivery_status is not None:
                     update_fields.append("delivery_status = ?")
                     update_values.append(delivery_status)
-                    # 同时更新order_status字段
-                    update_fields.append("order_status = ?")
-                    update_values.append(delivery_status)
+
+                    merged_order_status = self.resolve_external_order_status(
+                        current_order_status,
+                        delivery_status,
+                        source='yifan_status'
+                    )
+                    normalized_current_status = self._normalize_order_status(current_order_status)
+                    if merged_order_status and merged_order_status != normalized_current_status:
+                        update_fields.append("order_status = ?")
+                        update_values.append(merged_order_status)
                 
                 if callback_data is not None:
                     update_fields.append("callback_data = ?")
@@ -6609,12 +7715,14 @@ Cookie数量: {cookie_count}
             logger.error(f"更新风控日志失败: {e}")
             return False
 
-    def get_risk_control_logs(self, cookie_id: str = None, limit: int = 100, offset: int = 0) -> List[Dict]:
+    def get_risk_control_logs(self, cookie_id: str = None, processing_status: str = None,
+                              limit: int = 100, offset: int = 0) -> List[Dict]:
         """
         获取风控日志列表
 
         Args:
             cookie_id: Cookie ID，为None时获取所有日志
+            processing_status: 处理状态，为None时不过滤状态
             limit: 限制返回数量
             offset: 偏移量
 
@@ -6625,23 +7733,28 @@ Cookie数量: {cookie_count}
             with self.lock:
                 cursor = self.conn.cursor()
 
+                query = '''
+                    SELECT r.*, c.id as cookie_name
+                    FROM risk_control_logs r
+                    LEFT JOIN cookies c ON r.cookie_id = c.id
+                '''
+                conditions = []
+                params = []
+
                 if cookie_id:
-                    cursor.execute('''
-                        SELECT r.*, c.id as cookie_name
-                        FROM risk_control_logs r
-                        LEFT JOIN cookies c ON r.cookie_id = c.id
-                        WHERE r.cookie_id = ?
-                        ORDER BY r.created_at DESC
-                        LIMIT ? OFFSET ?
-                    ''', (cookie_id, limit, offset))
-                else:
-                    cursor.execute('''
-                        SELECT r.*, c.id as cookie_name
-                        FROM risk_control_logs r
-                        LEFT JOIN cookies c ON r.cookie_id = c.id
-                        ORDER BY r.created_at DESC
-                        LIMIT ? OFFSET ?
-                    ''', (limit, offset))
+                    conditions.append('r.cookie_id = ?')
+                    params.append(cookie_id)
+
+                if processing_status:
+                    conditions.append('r.processing_status = ?')
+                    params.append(processing_status)
+
+                if conditions:
+                    query += ' WHERE ' + ' AND '.join(conditions)
+
+                query += ' ORDER BY r.created_at DESC LIMIT ? OFFSET ?'
+                params.extend([limit, offset])
+                cursor.execute(query, params)
 
                 columns = [description[0] for description in cursor.description]
                 logs = []
@@ -6655,12 +7768,13 @@ Cookie数量: {cookie_count}
             logger.error(f"获取风控日志失败: {e}")
             return []
 
-    def get_risk_control_logs_count(self, cookie_id: str = None) -> int:
+    def get_risk_control_logs_count(self, cookie_id: str = None, processing_status: str = None) -> int:
         """
         获取风控日志总数
 
         Args:
             cookie_id: Cookie ID，为None时获取所有日志数量
+            processing_status: 处理状态，为None时不过滤状态
 
         Returns:
             int: 日志总数
@@ -6669,10 +7783,22 @@ Cookie数量: {cookie_count}
             with self.lock:
                 cursor = self.conn.cursor()
 
+                query = 'SELECT COUNT(*) FROM risk_control_logs'
+                conditions = []
+                params = []
+
                 if cookie_id:
-                    cursor.execute('SELECT COUNT(*) FROM risk_control_logs WHERE cookie_id = ?', (cookie_id,))
-                else:
-                    cursor.execute('SELECT COUNT(*) FROM risk_control_logs')
+                    conditions.append('cookie_id = ?')
+                    params.append(cookie_id)
+
+                if processing_status:
+                    conditions.append('processing_status = ?')
+                    params.append(processing_status)
+
+                if conditions:
+                    query += ' WHERE ' + ' AND '.join(conditions)
+
+                cursor.execute(query, params)
 
                 return cursor.fetchone()[0]
         except Exception as e:
