@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: yourusername/xianyu-auto-reply   # 替换为你的 Docker Hub 用户名/仓库名
+  IMAGE_NAME: dragonwell/xianyu-auto-reply   # 替换为你的 Docker Hub 用户名/仓库名
 
 jobs:
   build-and-push:
