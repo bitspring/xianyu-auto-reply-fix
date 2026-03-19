@@ -457,6 +457,8 @@ class DBManager:
                 spec_value_2 TEXT,
                 quantity TEXT,
                 amount TEXT,
+                bargain_flow_detected INTEGER DEFAULT 0,
+                bargain_success_detected INTEGER DEFAULT 0,
                 order_status TEXT DEFAULT 'unknown',
                 pre_refund_status TEXT,
                 cookie_id TEXT,
@@ -492,6 +494,22 @@ class DBManager:
                 logger.info("正在为 orders 表添加 pre_refund_status 列...")
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN pre_refund_status TEXT")
                 logger.info("orders 表 pre_refund_status 列添加完成")
+
+            # 检查并添加 bargain_flow_detected 列（用于记录小刀/拼团成交价覆盖）
+            try:
+                self._execute_sql(cursor, "SELECT bargain_flow_detected FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 bargain_flow_detected 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN bargain_flow_detected INTEGER DEFAULT 0")
+                logger.info("orders 表 bargain_flow_detected 列添加完成")
+
+            # 检查并添加 bargain_success_detected 列（用于记录小刀已进入第二阶段的成功证据）
+            try:
+                self._execute_sql(cursor, "SELECT bargain_success_detected FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 bargain_success_detected 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN bargain_success_detected INTEGER DEFAULT 0")
+                logger.info("orders 表 bargain_success_detected 列添加完成")
 
             # 检查并添加 user_id 列（用于数据库迁移）
             try:
@@ -6539,7 +6557,8 @@ Cookie数量: {cookie_count}
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               sid: str = None, spec_name_2: str = None, spec_value_2: str = None,
-                              buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False):
+                              buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False,
+                              bargain_flow_detected=..., bargain_success_detected=...):
         """插入或更新订单信息
 
         Args:
@@ -6616,6 +6635,12 @@ Cookie数量: {cookie_count}
                     if amount is not None:
                         update_fields.append("amount = ?")
                         update_values.append(amount)
+                    if bargain_flow_detected is not ...:
+                        update_fields.append("bargain_flow_detected = ?")
+                        update_values.append(1 if bargain_flow_detected else 0)
+                    if bargain_success_detected is not ...:
+                        update_fields.append("bargain_success_detected = ?")
+                        update_values.append(1 if bargain_success_detected else 0)
                     if order_status is not None:
                         update_fields.append("order_status = ?")
                         update_values.append(normalized_order_status or 'unknown')
@@ -6647,6 +6672,13 @@ Cookie数量: {cookie_count}
                         spec_name_2, spec_value_2, quantity, amount, normalized_order_status or 'unknown', cookie_id
                     ]
 
+                    if bargain_flow_detected is not ...:
+                        insert_fields.append('bargain_flow_detected')
+                        insert_values.append(1 if bargain_flow_detected else 0)
+                    if bargain_success_detected is not ...:
+                        insert_fields.append('bargain_success_detected')
+                        insert_values.append(1 if bargain_success_detected else 0)
+
                     if has_pre_refund_status and not clear_pre_refund_status:
                         insert_fields.append('pre_refund_status')
                         insert_values.append(normalized_pre_refund_status)
@@ -6671,7 +6703,7 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, pre_refund_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, pre_refund_status, cookie_id, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -6689,11 +6721,13 @@ Cookie数量: {cookie_count}
                         'spec_value_2': row[8],
                         'quantity': row[9],
                         'amount': row[10],
-                        'order_status': row[11],
-                        'pre_refund_status': row[12],
-                        'cookie_id': row[13],
-                        'created_at': row[14],
-                        'updated_at': row[15]
+                        'bargain_flow_detected': bool(row[11]),
+                        'bargain_success_detected': bool(row[12]),
+                        'order_status': row[13],
+                        'pre_refund_status': row[14],
+                        'cookie_id': row[15],
+                        'created_at': row[16],
+                        'updated_at': row[17]
                     }
                 return None
 
@@ -7049,7 +7083,7 @@ Cookie数量: {cookie_count}
 
                 sql = f'''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, cookie_id, created_at, updated_at
                 FROM orders
                 WHERE {" AND ".join(conditions)}
                 ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, created_at DESC
@@ -7087,10 +7121,12 @@ Cookie数量: {cookie_count}
                         'spec_value_2': row[8],
                         'quantity': row[9],
                         'amount': row[10],
-                        'order_status': row[11],
-                        'cookie_id': row[12],
-                        'created_at': row[13],
-                        'updated_at': row[14],
+                        'bargain_flow_detected': bool(row[11]),
+                        'bargain_success_detected': bool(row[12]),
+                        'order_status': row[13],
+                        'cookie_id': row[14],
+                        'created_at': row[15],
+                        'updated_at': row[16],
                     })
 
                 return orders
