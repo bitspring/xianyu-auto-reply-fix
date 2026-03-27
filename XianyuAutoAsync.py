@@ -223,6 +223,53 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
+
+    # 扫码登录token预热缓存，避免扫码成功后正式任务立即再次刷新token
+    _qr_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float}}
+    _qr_prewarmed_token_ttl = 180  # 秒
+
+    @classmethod
+    def _cleanup_qr_prewarmed_tokens(cls):
+        """清理过期的扫码预热token缓存"""
+        now = time.time()
+        expired_cookie_ids = [
+            cookie_id
+            for cookie_id, token_info in cls._qr_prewarmed_tokens.items()
+            if now - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl
+        ]
+        for cookie_id in expired_cookie_ids:
+            cls._qr_prewarmed_tokens.pop(cookie_id, None)
+
+    @classmethod
+    def cache_qr_prewarmed_token(cls, cookie_id: str, token: str):
+        """缓存扫码登录预热好的token，供后续正式实例直接复用"""
+        if not cookie_id or not token:
+            return
+        cls._cleanup_qr_prewarmed_tokens()
+        cls._qr_prewarmed_tokens[cookie_id] = {
+            'token': token,
+            'timestamp': time.time()
+        }
+
+    @classmethod
+    def pop_qr_prewarmed_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
+        """弹出扫码登录预热token，过期则忽略"""
+        if not cookie_id:
+            return None
+        cls._cleanup_qr_prewarmed_tokens()
+        token_info = cls._qr_prewarmed_tokens.pop(cookie_id, None)
+        if not token_info:
+            return None
+        if time.time() - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl:
+            return None
+        return token_info
+
+    @classmethod
+    def clear_qr_prewarmed_token(cls, cookie_id: str):
+        """清理指定账号的扫码预热token缓存"""
+        if not cookie_id:
+            return
+        cls._qr_prewarmed_tokens.pop(cookie_id, None)
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -262,6 +309,18 @@ class XianyuLive:
         if len(segments) > 6:
             preview += f"; ...(+{len(segments) - 6} fields)"
         return preview
+
+    @staticmethod
+    def _extract_cookie_value(cookie_info: Optional[Dict[str, Any]]) -> str:
+        """兼容不同调用方返回字段名，提取cookie字符串"""
+        if not cookie_info:
+            return ''
+        return (
+            cookie_info.get('value')
+            or cookie_info.get('cookies_str')
+            or cookie_info.get('cookie_value')
+            or ''
+        )
 
     def _load_proxy_config(self) -> dict:
         """从数据库加载当前账号的代理配置"""
@@ -779,6 +838,12 @@ class XianyuLive:
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
+
+        prewarmed_token_info = self.pop_qr_prewarmed_token(self.cookie_id)
+        if prewarmed_token_info:
+            self.current_token = prewarmed_token_info.get('token')
+            self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
+            logger.info(f"【{cookie_id}】已复用扫码预热token，跳过首次token刷新")
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -2840,8 +2905,10 @@ class XianyuLive:
         if not normalized_text:
             return None
 
+        direct_match_found = False
         direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
         if direct_match:
+            direct_match_found = True
             normalized_text = direct_match.group(1)
 
         colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
@@ -2849,9 +2916,10 @@ class XianyuLive:
         if long_numeric_parts:
             return long_numeric_parts[0]
 
-        generic_matches = re.findall(r'\d{16,}', normalized_text)
-        if generic_matches:
-            return generic_matches[0]
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
         return None
 
     def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
@@ -2876,7 +2944,6 @@ class XianyuLive:
         text_lower = normalized_text.lower()
         if (
             'updatekey' in source_lower
-            or 'extjson' in source_lower
             or 'updatekey' in text_lower
             or ('trade_' in text_lower and ':' in normalized_text)
             or ('buyer_confirm' in text_lower and ':' in normalized_text)
@@ -3991,8 +4058,8 @@ class XianyuLive:
             try:
                 from db_manager import db_manager
                 account_info = db_manager.get_cookie_details(self.cookie_id)
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
+                new_cookies_str = self._extract_cookie_value(account_info)
+                if new_cookies_str:
                     if new_cookies_str != self.cookies_str:
                         logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                         self.cookies_str = new_cookies_str
@@ -9459,6 +9526,42 @@ Cookie数量: {cookie_count}
             for cookie in updated_cookies:
                 real_cookies_dict[cookie['name']] = cookie['value']
 
+            # 现有账号不要直接整包覆盖旧Cookie，保留扫码前已经存在但本次页面未返回的字段
+            from db_manager import db_manager
+            existing_cookie = db_manager.get_cookie_details(target_cookie_id)
+            existing_cookie_value = self._extract_cookie_value(existing_cookie)
+            if existing_cookie_value:
+                try:
+                    existing_cookies_dict = trans_cookies(existing_cookie_value)
+                    if existing_cookies_dict:
+                        merged_cookies_dict = existing_cookies_dict.copy()
+                        updated_fields = []
+
+                        for name, value in real_cookies_dict.items():
+                            old_value = merged_cookies_dict.get(name)
+                            if old_value is None:
+                                updated_fields.append(f"{name}(新增)")
+                            elif old_value != value:
+                                updated_fields.append(name)
+                            merged_cookies_dict[name] = value
+
+                        preserved_fields = [name for name in existing_cookies_dict.keys() if name not in real_cookies_dict]
+                        preserved_x5_fields = [
+                            name for name in preserved_fields
+                            if name.lower().startswith('x5') or 'x5sec' in name.lower()
+                        ]
+
+                        if updated_fields:
+                            logger.info(f"【{target_cookie_id}】扫码登录合并更新Cookie字段: {', '.join(updated_fields)}")
+                        if preserved_fields:
+                            logger.info(f"【{target_cookie_id}】扫码登录保留现有Cookie字段 ({len(preserved_fields)}个): {', '.join(preserved_fields)}")
+                        if preserved_x5_fields:
+                            logger.warning(f"【{target_cookie_id}】扫码登录保留风控Cookie字段: {', '.join(preserved_x5_fields)}")
+
+                        real_cookies_dict = merged_cookies_dict
+                except Exception as merge_e:
+                    logger.warning(f"【{target_cookie_id}】合并现有账号Cookie失败，继续使用扫码获取到的Cookie: {self._safe_str(merge_e)}")
+
             # 生成真实cookie字符串
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
 
@@ -9553,8 +9656,6 @@ Cookie数量: {cookie_count}
                     logger.info(f"【{target_cookie_id}】{cookie_name}: [不存在]")
 
             # 保存真实Cookie到数据库
-            from db_manager import db_manager
-            
             # 检查是否为新账号
             existing_cookie = db_manager.get_cookie_details(target_cookie_id)
             if existing_cookie:
@@ -12620,6 +12721,26 @@ Cookie数量: {cookie_count}
             "total_saved": total_saved,
             "items": all_items
         }
+
+    def _get_item_polish_module(self):
+        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
+            from item_polish_module import ItemPolishModule
+        else:
+            from secure_item_polish_ultra import ItemPolishModule
+
+        return ItemPolishModule(self)
+
+    async def polish_item(self, item_id, retry_count=0):
+        """擦亮单个商品。"""
+        return await self._get_item_polish_module().polish_item(item_id, retry_count)
+
+    async def _polish_item_backup(self, item_id):
+        """使用备用API擦亮商品。"""
+        return await self._get_item_polish_module()._polish_item_backup(item_id)
+
+    async def polish_all_items(self):
+        """擦亮所有在售商品。"""
+        return await self._get_item_polish_module().polish_all_items()
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""
