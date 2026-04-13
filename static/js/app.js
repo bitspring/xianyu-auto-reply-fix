@@ -9,9 +9,21 @@ let editCookieId = '';
 let authToken = localStorage.getItem('auth_token');
 let dashboardData = {
     accounts: [],
-    totalKeywords: 0
+    totalKeywords: 0,
+    totalItems: 0
 };
 let pendingAccountManagementFocusId = '';
+let aboutDiagnosticsAccounts = [];
+let aboutDiagnosticsInitialized = false;
+let dashboardRuntimeRetryTimer = null;
+let aboutRuntimeRetryTimer = null;
+let lastDashboardRuntimeRetryAt = 0;
+let lastAboutRuntimeRetryAt = 0;
+const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
+let dashboardAnnouncementState = {
+    current: null,
+    history: []
+};
 
 // 账号关键词缓存
 let accountKeywordCache = {};
@@ -37,6 +49,11 @@ let ordersStreamAbortController = null;
 let ordersStreamReconnectTimer = null;
 let ordersStreamRetryCount = 0;
 let ordersStreamShouldRun = false;
+let orderHistorySyncModalInstance = null;
+let orderHistorySyncPollingTimer = null;
+let activeOrderHistorySyncJobId = '';
+let orderHistorySyncNotifiedJobId = '';
+let orderHistorySyncAccounts = [];
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
 const LOADING_SHOW_DELAY = 120;
@@ -163,6 +180,16 @@ function showSection(sectionName) {
         button.textContent = '开启自动刷新';
         if (icon) icon.className = 'bi bi-play-circle me-1';
     }
+    }
+
+    if (sectionName !== 'dashboard' && dashboardRuntimeRetryTimer) {
+        clearTimeout(dashboardRuntimeRetryTimer);
+        dashboardRuntimeRetryTimer = null;
+    }
+
+    if (sectionName !== 'accounts' && aboutRuntimeRetryTimer) {
+        clearTimeout(aboutRuntimeRetryTimer);
+        aboutRuntimeRetryTimer = null;
     }
 }
 
@@ -326,6 +353,266 @@ async function enrichDashboardAccounts(accounts) {
     }));
 }
 
+function getDashboardAnnouncementDismissKey(id) {
+    return `${DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX}${String(id || '').trim()}`;
+}
+
+function normalizeDashboardAnnouncementState(payload) {
+    return {
+        current: payload?.current || null,
+        history: Array.isArray(payload?.history) ? payload.history : []
+    };
+}
+
+function isDashboardAnnouncementDismissed(announcement) {
+    const announcementId = String(announcement?.id || '').trim();
+    if (!announcementId) {
+        return false;
+    }
+    return localStorage.getItem(getDashboardAnnouncementDismissKey(announcementId)) === 'true';
+}
+
+function dismissDashboardAnnouncement(announcement) {
+    const announcementId = String(announcement?.id || '').trim();
+    if (announcementId) {
+        localStorage.setItem(getDashboardAnnouncementDismissKey(announcementId), 'true');
+    }
+    renderDashboardAnnouncement();
+}
+
+function handleDashboardAnnouncementAction(announcement) {
+    const actionType = String(announcement?.action_type || '').trim().toLowerCase();
+    if (!actionType) {
+        return;
+    }
+
+    if (actionType === 'changelog') {
+        showChangelogModal();
+        return;
+    }
+
+    if (actionType === 'update') {
+        performHotUpdate();
+        return;
+    }
+
+    if (actionType === 'url') {
+        const targetUrl = String(announcement?.action_url || '').trim();
+        if (targetUrl) {
+            window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        }
+    }
+}
+
+function getDashboardAnnouncementLevelText(level) {
+    const normalizedLevel = String(level || '').trim().toLowerCase();
+    if (normalizedLevel === 'success') return '成功';
+    if (normalizedLevel === 'warning') return '提醒';
+    if (normalizedLevel === 'danger') return '重要';
+    return '公告';
+}
+
+function getDashboardAnnouncementStatusText(status) {
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    if (normalizedStatus === 'active') return '当前生效';
+    if (normalizedStatus === 'scheduled') return '尚未生效';
+    if (normalizedStatus === 'expired') return '已结束';
+    if (normalizedStatus === 'disabled') return '未启用';
+    return '历史记录';
+}
+
+function getDashboardAnnouncementDisplayTime(announcement) {
+    const timeValue = String(
+        announcement?.published_at
+        || announcement?.start_at
+        || announcement?.end_at
+        || ''
+    ).trim();
+    if (!timeValue) {
+        return '未设置时间';
+    }
+    return formatDateTime(timeValue);
+}
+
+function showDashboardAnnouncementHistoryModal() {
+    const history = Array.isArray(dashboardAnnouncementState.history) ? dashboardAnnouncementState.history : [];
+    if (!history.length) {
+        showToast('暂无公告记录', 'info');
+        return;
+    }
+
+    const modalId = 'dashboardAnnouncementHistoryModal';
+    const existingModal = document.getElementById(modalId);
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    const historyHtml = history.map((announcement, index) => {
+        const level = ['info', 'success', 'warning', 'danger'].includes(String(announcement?.level || '').trim().toLowerCase())
+            ? String(announcement.level || '').trim().toLowerCase()
+            : 'info';
+        const status = String(announcement?.status || '').trim().toLowerCase() || 'disabled';
+        const title = String(announcement?.title || '').trim() || '未命名公告';
+        const message = String(announcement?.message || '').trim() || '暂无内容';
+        const actionText = String(announcement?.action_type ? (announcement?.action_text || '') : '').trim();
+        const timeText = getDashboardAnnouncementDisplayTime(announcement);
+        const currentBadge = announcement?.is_current
+            ? '<span class="dashboard-announcement-history-badge is-current">当前</span>'
+            : '';
+
+        return `
+            <article class="dashboard-announcement-history-item ${announcement?.is_current ? 'is-current' : ''}">
+                <div class="dashboard-announcement-history-head">
+                    <div class="dashboard-announcement-history-meta">
+                        <div class="dashboard-announcement-history-title-row">
+                            <h6 class="dashboard-announcement-history-title mb-0">${escapeHtml(title)}</h6>
+                            ${currentBadge}
+                            <span class="dashboard-announcement-history-badge is-${level}">${escapeHtml(getDashboardAnnouncementLevelText(level))}</span>
+                            <span class="dashboard-announcement-history-badge is-status">${escapeHtml(getDashboardAnnouncementStatusText(status))}</span>
+                        </div>
+                        <div class="dashboard-announcement-history-time">
+                            <i class="bi bi-clock-history"></i>
+                            <span>${escapeHtml(timeText)}</span>
+                        </div>
+                    </div>
+                    ${actionText ? `
+                        <button
+                            type="button"
+                            class="btn btn-sm dashboard-announcement-history-action"
+                            data-announcement-history-action-index="${index}"
+                        >
+                            ${escapeHtml(actionText)}
+                        </button>
+                    ` : ''}
+                </div>
+                <div class="dashboard-announcement-history-message">${escapeHtml(message)}</div>
+            </article>
+        `;
+    }).join('');
+
+    document.body.insertAdjacentHTML('beforeend', `
+        <div class="modal fade" id="${modalId}" tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+                <div class="modal-content dashboard-announcement-history-modal">
+                    <div class="modal-header dashboard-announcement-history-modal-header">
+                        <div>
+                            <h5 class="modal-title mb-1">
+                                <i class="bi bi-megaphone-fill me-2"></i>公告记录
+                            </h5>
+                            <div class="dashboard-announcement-history-modal-subtitle">按发布时间倒序展示近期公告内容</div>
+                        </div>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="关闭"></button>
+                    </div>
+                    <div class="modal-body dashboard-announcement-history-modal-body">
+                        <div class="dashboard-announcement-history-list">
+                            ${historyHtml}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `);
+
+    const modalElement = document.getElementById(modalId);
+    if (!modalElement) {
+        return;
+    }
+
+    modalElement.querySelectorAll('[data-announcement-history-action-index]').forEach(button => {
+        button.addEventListener('click', () => {
+            const index = Number(button.getAttribute('data-announcement-history-action-index'));
+            const announcement = Number.isFinite(index) ? history[index] : null;
+            if (!announcement) {
+                return;
+            }
+            const modalInstance = bootstrap.Modal.getInstance(modalElement);
+            if (modalInstance) {
+                modalInstance.hide();
+            }
+            setTimeout(() => {
+                handleDashboardAnnouncementAction(announcement);
+            }, 120);
+        });
+    });
+
+    modalElement.addEventListener('hidden.bs.modal', () => {
+        modalElement.remove();
+    }, { once: true });
+
+    const modal = new bootstrap.Modal(modalElement);
+    modal.show();
+}
+
+function renderDashboardAnnouncement() {
+    const slot = document.getElementById('dashboardAnnouncementSlot');
+    if (!slot) return;
+
+    const currentAnnouncement = dashboardAnnouncementState.current;
+    if (!currentAnnouncement || isDashboardAnnouncementDismissed(currentAnnouncement)) {
+        slot.style.display = 'none';
+        slot.innerHTML = '';
+        return;
+    }
+
+    const level = ['info', 'success', 'warning', 'danger'].includes(String(currentAnnouncement.level || '').trim().toLowerCase())
+        ? String(currentAnnouncement.level || '').trim().toLowerCase()
+        : 'info';
+    const title = String(currentAnnouncement.title || '').trim();
+    const message = String(currentAnnouncement.message || '').trim();
+    const actionText = String(currentAnnouncement.action_type ? (currentAnnouncement.action_text || '') : '').trim();
+    const dismissible = currentAnnouncement.dismissible !== false;
+
+    slot.style.display = '';
+    slot.innerHTML = `
+        <div class="dashboard-announcement-card is-${level}" role="status" aria-live="polite">
+            <button
+                type="button"
+                class="dashboard-announcement-main"
+                id="dashboardAnnouncementOpenBtn"
+                title="点击查看公告记录"
+                aria-label="查看公告记录"
+            >
+                <span class="dashboard-announcement-icon">
+                    <i class="bi bi-megaphone-fill"></i>
+                </span>
+                <span class="dashboard-announcement-body">
+                    ${title ? `<span class="dashboard-announcement-title">${escapeHtml(title)}</span>` : ''}
+                    ${message ? `<span class="dashboard-announcement-message">${escapeHtml(message)}</span>` : ''}
+                </span>
+            </button>
+            <div class="dashboard-announcement-actions">
+                ${actionText ? `<button type="button" class="btn btn-sm dashboard-announcement-action" id="dashboardAnnouncementActionBtn">${escapeHtml(actionText)}</button>` : ''}
+                ${dismissible ? `
+                    <button type="button" class="btn btn-sm dashboard-announcement-close" id="dashboardAnnouncementCloseBtn" aria-label="关闭公告">
+                        <i class="bi bi-x-lg"></i>
+                    </button>
+                ` : ''}
+            </div>
+        </div>
+    `;
+
+    const openButton = document.getElementById('dashboardAnnouncementOpenBtn');
+    if (openButton) {
+        openButton.onclick = () => showDashboardAnnouncementHistoryModal();
+    }
+
+    const actionButton = document.getElementById('dashboardAnnouncementActionBtn');
+    if (actionButton) {
+        actionButton.onclick = () => handleDashboardAnnouncementAction(currentAnnouncement);
+    }
+
+    const closeButton = document.getElementById('dashboardAnnouncementCloseBtn');
+    if (closeButton) {
+        closeButton.onclick = () => dismissDashboardAnnouncement(currentAnnouncement);
+    }
+}
+
+async function loadDashboardAnnouncement() {
+    const result = await fetchDashboardResource('/api/announcement', { success: false, current: null, history: [] });
+    dashboardAnnouncementState = normalizeDashboardAnnouncementState(result?.success ? result : null);
+    renderDashboardAnnouncement();
+}
+
 function renderDashboardSummaryCard(label, value, tone = 'primary', details = []) {
     const detailMarkup = Array.isArray(details) && details.length ? `
         <div class="dashboard-account-summary-details">
@@ -356,6 +643,231 @@ function renderDashboardAccountMetric(label, value, tone = 'off') {
         <div class="dashboard-account-metric is-${tone}">
             <div class="dashboard-account-metric-label">${escapeHtml(label)}</div>
             <div class="dashboard-account-metric-value">${escapeHtml(value)}</div>
+        </div>
+    `;
+}
+
+function isRuntimeStatusHealthy(runtimeStatus) {
+    return Boolean(
+        runtimeStatus?.running
+        && runtimeStatus.ws_ready
+        && runtimeStatus.session_ready
+        && runtimeStatus.has_current_token
+        && runtimeStatus.message_stream_ready
+    );
+}
+
+function getRuntimeStatusRecentAnchor(runtimeStatus) {
+    const normalizedRuntimeStatus = runtimeStatus || {};
+    const timestampKeys = [
+        'state_last_changed_at',
+        'last_successful_connection_at',
+        'last_heartbeat_response_at',
+        'session_keepalive_at',
+        'token_last_refreshed_at',
+        'last_message_received_at',
+    ];
+
+    const timestamps = timestampKeys
+        .map(key => Number(normalizedRuntimeStatus[key] || 0))
+        .filter(value => Number.isFinite(value) && value > 0);
+
+    return timestamps.length ? Math.max(...timestamps) : 0;
+}
+
+function shouldAutoRetryRuntimeStatus(runtimeStatus) {
+    if (!runtimeStatus?.running) {
+        return false;
+    }
+
+    const connectionState = String(runtimeStatus.connection_state || '').trim();
+    if (connectionState === 'connecting' || connectionState === 'reconnecting') {
+        return true;
+    }
+
+    if (isRuntimeStatusHealthy(runtimeStatus)) {
+        return false;
+    }
+
+    const recentAnchor = getRuntimeStatusRecentAnchor(runtimeStatus);
+    if (!recentAnchor) {
+        return false;
+    }
+
+    return ((Date.now() / 1000) - recentAnchor) <= 90;
+}
+
+function getMessageStreamRuntimeDisplay(runtimeStatus) {
+    const normalizedRuntimeStatus = runtimeStatus || {};
+    const explicitStatus = String(normalizedRuntimeStatus.message_stream_status || '').trim();
+    const explicitNote = String(normalizedRuntimeStatus.message_stream_note || '').trim();
+    const connectionState = String(normalizedRuntimeStatus.connection_state || '').trim();
+
+    let status = explicitStatus;
+    if (!status) {
+        if (!normalizedRuntimeStatus.running) {
+            status = 'not_running';
+        } else if (connectionState === 'connecting' || connectionState === 'reconnecting') {
+            status = 'recovering';
+        } else if (connectionState !== 'connected' || normalizedRuntimeStatus.ws_ready === false) {
+            status = 'connection_unready';
+        } else if (normalizedRuntimeStatus.message_stream_ready) {
+            status = 'watching';
+        } else {
+            status = 'connection_unready';
+        }
+    }
+
+    let note = explicitNote;
+    if (!note) {
+        if (!normalizedRuntimeStatus.running) {
+            note = '账号实例未启动，业务消息流尚未建立';
+        } else if (status === 'recovering') {
+            note = '连接正在恢复，业务消息流状态将在重连稳定后更新';
+        } else if (status === 'connection_unready') {
+            note = '连接未就绪，业务消息流状态待 WebSocket 恢复后更新';
+        } else if (status === 'watching') {
+            note = '当前连接尚未收到非心跳业务包';
+        } else {
+            note = '业务消息流状态等待更多运行时数据';
+        }
+    }
+
+    return { status, note };
+}
+
+function scheduleDashboardRuntimeAutoRetry(accounts) {
+    if (dashboardRuntimeRetryTimer) {
+        clearTimeout(dashboardRuntimeRetryTimer);
+        dashboardRuntimeRetryTimer = null;
+    }
+
+    if (!document.getElementById('dashboard-section')?.classList.contains('active')) {
+        return;
+    }
+
+    if (!Array.isArray(accounts) || !accounts.some(account => shouldAutoRetryRuntimeStatus(account.runtime_status))) {
+        return;
+    }
+
+    if (Date.now() - lastDashboardRuntimeRetryAt < 15000) {
+        return;
+    }
+
+    const hasTransientState = accounts.some(account => {
+        const connectionState = String(account?.runtime_status?.connection_state || '').trim();
+        return connectionState === 'connecting' || connectionState === 'reconnecting';
+    });
+    const delay = hasTransientState ? 3500 : 5000;
+
+    dashboardRuntimeRetryTimer = setTimeout(() => {
+        dashboardRuntimeRetryTimer = null;
+        if (!document.getElementById('dashboard-section')?.classList.contains('active')) {
+            return;
+        }
+        lastDashboardRuntimeRetryAt = Date.now();
+        refreshDashboardRuntimeSnapshots();
+    }, delay);
+}
+
+function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus) {
+    if (aboutRuntimeRetryTimer) {
+        clearTimeout(aboutRuntimeRetryTimer);
+        aboutRuntimeRetryTimer = null;
+    }
+
+    const normalizedAccountId = String(accountId || '').trim();
+    if (!normalizedAccountId) {
+        return;
+    }
+
+    if (!document.getElementById('accounts-section')?.classList.contains('active')) {
+        return;
+    }
+
+    if (!shouldAutoRetryRuntimeStatus(runtimeStatus)) {
+        return;
+    }
+
+    if (Date.now() - lastAboutRuntimeRetryAt < 12000) {
+        return;
+    }
+
+    const connectionState = String(runtimeStatus?.connection_state || '').trim();
+    const delay = (connectionState === 'connecting' || connectionState === 'reconnecting') ? 3000 : 5000;
+
+    aboutRuntimeRetryTimer = setTimeout(() => {
+        aboutRuntimeRetryTimer = null;
+        if (!document.getElementById('accounts-section')?.classList.contains('active')) {
+            return;
+        }
+        if (getAboutSelectedAccountId() !== normalizedAccountId) {
+            return;
+        }
+        lastAboutRuntimeRetryAt = Date.now();
+        loadAboutRuntimeStatus(normalizedAccountId);
+    }, delay);
+}
+
+function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
+    const normalizedRuntimeStatus = runtimeStatus || {};
+    const connectionState = normalizedRuntimeStatus.connection_state || 'not_running';
+    const keepaliveDisplayStatus = normalizedRuntimeStatus.session_keepalive_display_status || normalizedRuntimeStatus.session_keepalive_status || '';
+    const tokenStatus = normalizedRuntimeStatus.token_refresh_status || '';
+    const messageStreamDisplay = getMessageStreamRuntimeDisplay(normalizedRuntimeStatus);
+    const messageStreamStatus = messageStreamDisplay.status;
+
+    const connectionText = getAboutStatusText('connection', connectionState) || '未运行';
+    const connectionTone = getAboutStatusVariant('connection', connectionState);
+    const keepaliveText = keepaliveDisplayStatus
+        ? (getAboutStatusText('keepalive', keepaliveDisplayStatus) || keepaliveDisplayStatus)
+        : (normalizedRuntimeStatus.running ? '未执行' : '未运行');
+    const keepaliveTone = keepaliveDisplayStatus
+        ? getAboutStatusVariant('keepalive', keepaliveDisplayStatus)
+        : 'secondary';
+    const tokenText = tokenStatus
+        ? (getAboutStatusText('token', tokenStatus) || tokenStatus)
+        : (normalizedRuntimeStatus.running ? '未刷新' : '未运行');
+    const tokenTone = tokenStatus
+        ? getAboutStatusVariant('token', tokenStatus)
+        : 'secondary';
+    const messageStreamText = messageStreamStatus
+        ? (getAboutStatusText('stream', messageStreamStatus) || messageStreamStatus)
+        : (normalizedRuntimeStatus.running ? '观察中' : '未运行');
+    const messageStreamTone = messageStreamStatus
+        ? getAboutStatusVariant('stream', messageStreamStatus)
+        : 'secondary';
+    const runningHealthy = isRuntimeStatusHealthy(normalizedRuntimeStatus);
+    const summaryText = !normalizedRuntimeStatus.running
+        ? '未运行'
+        : (runningHealthy ? '运行正常' : '部分异常');
+    const summaryTone = !normalizedRuntimeStatus.running
+        ? 'secondary'
+        : (runningHealthy ? 'success' : 'warning');
+    const items = [
+        { label: '连接', text: connectionText, tone: connectionTone },
+        { label: '保活', text: keepaliveText, tone: keepaliveTone },
+        { label: 'Token', text: tokenText, tone: tokenTone },
+        { label: '消息流', text: messageStreamText, tone: messageStreamTone }
+    ];
+
+    return `
+        <div class="dashboard-account-runtime" aria-label="账号运行态快照">
+            <div class="dashboard-account-runtime-summary is-${summaryTone}">
+                <span class="dashboard-account-runtime-summary-dot" aria-hidden="true"></span>
+                <span class="dashboard-account-runtime-summary-text">${escapeHtml(summaryText)}</span>
+            </div>
+            <div class="dashboard-account-runtime-signals">
+                ${items.map(item => {
+                    const detailText = `${item.label}: ${item.text}`;
+                    return `
+                        <span class="dashboard-account-runtime-signal is-${item.tone}" title="${escapeHtml(detailText)}" aria-label="${escapeHtml(detailText)}">
+                            <span class="dashboard-account-runtime-signal-dot" aria-hidden="true"></span>
+                            <span class="dashboard-account-runtime-signal-label">${escapeHtml(item.label)}</span>
+                        </span>
+                    `;
+                }).join('')}
+            </div>
         </div>
     `;
 }
@@ -408,6 +920,7 @@ function renderDashboardAccountCard(account) {
         renderDashboardAccountMetric('回复模式', replyModeText, replyModeTone),
         renderDashboardAccountMetric('定时擦亮', polishScheduleMetricText, polishScheduleTone)
     ].join('');
+    const runtimeSnapshot = renderDashboardAccountRuntimeSnapshot(account.runtime_status);
 
     const secondarySummary = [
         {
@@ -462,6 +975,7 @@ function renderDashboardAccountCard(account) {
                 </div>
             </div>
             <div class="dashboard-account-main-metrics">${metrics}</div>
+            ${runtimeSnapshot}
         </div>
     `;
 }
@@ -513,6 +1027,7 @@ function renderDashboardAccountOverview(accounts, totalItems = 0) {
 async function loadDashboard() {
     try {
     toggleLoading(true);
+    loadDashboardAnnouncement();
 
     // 获取账号列表
     const cookiesResponse = await fetch(`${apiBase}/cookies/details`, {
@@ -534,6 +1049,7 @@ async function loadDashboard() {
 
         // 加载商品总数
         const totalItems = await loadItemsCount();
+        dashboardData.totalItems = totalItems;
 
         // 加载订单看板数据
         const orderMetrics = await loadOrderDashboardMetrics();
@@ -546,6 +1062,7 @@ async function loadDashboard() {
 
         // 更新仪表盘显示
         renderDashboardAccountOverview(accountsWithKeywords, totalItems);
+        scheduleDashboardRuntimeAutoRetry(accountsWithKeywords);
         await loadDashboardDeliveryLogs();
     }
     } catch (error) {
@@ -553,6 +1070,35 @@ async function loadDashboard() {
     showToast('加载仪表盘数据失败', 'danger');
     } finally {
     toggleLoading(false);
+    }
+}
+
+async function refreshDashboardRuntimeSnapshots() {
+    if (!dashboardData.accounts.length) {
+        return;
+    }
+
+    try {
+        const cookieDetails = await fetchJSON(`${apiBase}/cookies/details`);
+        const runtimeStatusMap = new Map(
+            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [String(cookie.id), cookie.runtime_status || null])
+        );
+
+        dashboardData.accounts = dashboardData.accounts.map(account => {
+            const accountId = String(account.id || '');
+            if (!runtimeStatusMap.has(accountId)) {
+                return account;
+            }
+            return {
+                ...account,
+                runtime_status: runtimeStatusMap.get(accountId),
+            };
+        });
+
+        renderDashboardAccountOverview(dashboardData.accounts, dashboardData.totalItems || 0);
+        scheduleDashboardRuntimeAutoRetry(dashboardData.accounts);
+    } catch (error) {
+        console.error('刷新仪表盘运行态失败:', error);
     }
 }
 
@@ -625,7 +1171,7 @@ async function loadOrderDashboardMetrics() {
                 }
             }
 
-            if (isTodayOrder(order?.created_at)) {
+            if (isTodayOrder(getEffectiveOrderSalesTime(order))) {
                 todayOrders++;
             }
         });
@@ -1235,6 +1781,25 @@ const beijingMinuteFormatter = new Intl.DateTimeFormat('zh-CN', {
     hourCycle: 'h23'
 });
 
+const beijingDateFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+});
+
+const beijingSecondFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    hourCycle: 'h23'
+});
+
 function formatBeijingDateTime(dateString) {
     const date = parseUtcDateTime(dateString);
     if (!date) return '--';
@@ -1249,16 +1814,74 @@ function formatBeijingDateTime(dateString) {
     return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
-function isTodayOrder(createdAt) {
-    const orderDate = parseUtcDateTime(createdAt);
-    if (!orderDate) return false;
+function formatBeijingDateTimeWithSeconds(dateInput) {
+    const date = parseUtcDateTime(dateInput);
+    if (!date) return '--';
 
-    const now = new Date();
-    return (
-        orderDate.getFullYear() === now.getFullYear() &&
-        orderDate.getMonth() === now.getMonth() &&
-        orderDate.getDate() === now.getDate()
-    );
+    const parts = {};
+    beijingSecondFormatter.formatToParts(date).forEach(part => {
+        if (part.type !== 'literal') {
+            parts[part.type] = part.value;
+        }
+    });
+
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function getBeijingDateKey(dateInput) {
+    const date = parseUtcDateTime(dateInput);
+    if (!date) return '';
+
+    const parts = {};
+    beijingDateFormatter.formatToParts(date).forEach(part => {
+        if (part.type !== 'literal') {
+            parts[part.type] = part.value;
+        }
+    });
+
+    return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function getEffectiveOrderSalesTime(order) {
+    const platformPaidAt = String(order?.platform_paid_at || '').trim();
+    if (platformPaidAt) return platformPaidAt;
+
+    const platformCreatedAt = String(order?.platform_created_at || '').trim();
+    if (platformCreatedAt) return platformCreatedAt;
+
+    const createdAt = String(order?.created_at || '').trim();
+    return createdAt || null;
+}
+
+function formatAboutRuntimeTime(displayValue, rawTimestamp) {
+    const displayText = typeof displayValue === 'string' ? displayValue.trim() : '';
+    if (displayText) {
+        if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(displayText)) {
+            return displayText.replace('T', ' ');
+        }
+
+        const normalizedDisplay = formatBeijingDateTimeWithSeconds(displayText);
+        if (normalizedDisplay !== '--') {
+            return normalizedDisplay;
+        }
+
+        return displayText;
+    }
+
+    const numericTimestamp = Number(rawTimestamp);
+    if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
+        return '暂无记录';
+    }
+
+    const millis = numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000;
+    return formatBeijingDateTimeWithSeconds(new Date(millis));
+}
+
+function isTodayOrder(createdAt) {
+    const orderDateKey = getBeijingDateKey(createdAt);
+    if (!orderDateKey) return false;
+
+    return orderDateKey === getBeijingDateKey(new Date());
 }
 
 function updateDashboardOrderMetrics(metrics) {
@@ -2701,6 +3324,712 @@ async function fetchJSON(url, opts = {}) {
 }
 
 // ================================
+// 账号保活诊断
+// ================================
+
+function getAboutDiagnosticsElements() {
+    return {
+        accountSelect: document.getElementById('aboutDiagnosticsAccount'),
+        accountMeta: document.getElementById('aboutDiagnosticsAccountMeta'),
+        refreshButton: document.getElementById('aboutDiagnosticsRefreshBtn'),
+        keepaliveButton: document.getElementById('aboutDiagnosticsKeepaliveBtn'),
+        historyButton: document.getElementById('aboutDiagnosticsHistoryBtn'),
+        conversationInput: document.getElementById('aboutDiagnosticsConversationId'),
+        statusContainer: document.getElementById('aboutDiagnosticsStatus'),
+        historyContainer: document.getElementById('aboutConversationHistory'),
+    };
+}
+
+function getAboutSelectedAccountId() {
+    return document.getElementById('aboutDiagnosticsAccount')?.value?.trim() || '';
+}
+
+function getAboutStatusText(type, value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return '暂无';
+    }
+
+    const maps = {
+        connection: {
+            connected: '已连接',
+            reconnecting: '重连中',
+            connecting: '连接中',
+            disconnected: '未连接',
+            failed: '失败',
+            closed: '已关闭',
+            not_running: '未运行',
+            unknown: '未知',
+        },
+        keepalive: {
+            started: '执行中',
+            success: '成功',
+            recovered: '已恢复',
+            auth_failed: '鉴权失败',
+            api_failed: '接口失败',
+            network_failed: '网络异常',
+            response_parse_failed: '响应解析失败',
+            exception: '执行异常',
+        },
+        token: {
+            started: '执行中',
+            success: '成功',
+            skipped_cooldown: '冷却跳过',
+            manual_refresh_active: '手动刷新进行中',
+            manual_refresh_browser_stabilizing: '浏览器稳定中',
+            post_slider_session_settling: '滑块后稳定中',
+            restarted_after_cookie_refresh: '已触发重连',
+            captcha_max_retries_exceeded: '滑块重试超限',
+            token_expired_recovery_failed: '过期恢复失败',
+            token_refresh_failed: '刷新失败',
+            token_refresh_exception: '刷新异常',
+            token_init_failed: '初始化失败',
+            token_missing_after_refresh: '刷新后无 Token',
+            token_missing: '无 Token',
+            failed: '失败',
+        },
+        stream: {
+            healthy: '正常',
+            recovered: '已恢复',
+            warming_up: '预热中',
+            watching: '观察中',
+            recovering: '恢复中',
+            suspected_stale: '疑似停滞',
+            connection_unready: '连接未就绪',
+            not_running: '未运行',
+        },
+    };
+
+    return maps[type]?.[normalized] || normalized;
+}
+
+function getAboutStatusVariant(type, value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return 'secondary';
+    }
+
+    if (type === 'connection') {
+        if (normalized === 'connected') return 'success';
+        if (normalized === 'connecting' || normalized === 'reconnecting') return 'warning';
+        if (normalized === 'failed') return 'danger';
+        if (normalized === 'not_running' || normalized === 'disconnected' || normalized === 'closed') return 'secondary';
+        return 'info';
+    }
+
+    if (type === 'stream') {
+        if (normalized === 'healthy' || normalized === 'recovered') return 'success';
+        if (normalized === 'warming_up' || normalized === 'watching' || normalized === 'recovering') return 'info';
+        if (normalized === 'suspected_stale') return 'warning';
+        if (normalized === 'connection_unready' || normalized === 'not_running') return 'secondary';
+        return 'secondary';
+    }
+
+    if (normalized === 'success' || normalized === 'recovered') return 'success';
+    if (normalized === 'started' || normalized === 'connecting' || normalized === 'reconnecting') return 'info';
+    if (normalized.includes('failed') || normalized.includes('exception') || normalized.includes('error')) return 'danger';
+    if (normalized.includes('skipped') || normalized.includes('retry') || normalized.includes('restarted')) return 'warning';
+    return 'secondary';
+}
+
+function buildAboutStatusBadge(type, value) {
+    const text = getAboutStatusText(type, value);
+    const variant = getAboutStatusVariant(type, value);
+    return `<span class="about-status-badge is-${variant}">${escapeHtml(text)}</span>`;
+}
+
+function buildAboutMetaCard({ label, value, supporting = '' }) {
+    return `
+        <div class="account-diagnostics-summary-item">
+            <div class="account-diagnostics-summary-label">${escapeHtml(label)}</div>
+            <div class="account-diagnostics-summary-value">${escapeHtml(value)}</div>
+            ${supporting ? `<div class="account-diagnostics-summary-support">${escapeHtml(supporting)}</div>` : ''}
+        </div>
+    `;
+}
+
+function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richValue = false, accent = '', icon = '' }) {
+    return `
+        <div class="account-diagnostics-status-item ${tone ? `is-${tone}` : ''} ${accent ? `is-${accent}` : ''}">
+            <div class="account-diagnostics-status-item-head">
+                <div class="account-diagnostics-status-item-icon">
+                    ${icon ? `<i class="bi bi-${icon}"></i>` : ''}
+                </div>
+                <div class="account-diagnostics-status-item-label">${escapeHtml(label)}</div>
+            </div>
+            <div class="account-diagnostics-status-item-value">${richValue ? value : escapeHtml(value)}</div>
+            ${note ? `<div class="account-diagnostics-status-item-note">${escapeHtml(note)}</div>` : ''}
+        </div>
+    `;
+}
+
+function buildAboutRuntimeMetaItem(label, value) {
+    return `
+        <div class="account-diagnostics-status-meta-item">
+            <span class="account-diagnostics-status-meta-label">${escapeHtml(label)}</span>
+            <span class="account-diagnostics-status-meta-value">${escapeHtml(value)}</span>
+        </div>
+    `;
+}
+
+function buildAboutReadinessValue(items) {
+    const normalizedItems = Array.isArray(items) ? items : [];
+    const totalCount = normalizedItems.length;
+    const readyCount = normalizedItems.filter(item => item.ready).length;
+    const progressPercent = totalCount
+        ? Math.max(0, Math.min(100, Math.round((readyCount / totalCount) * 100)))
+        : 0;
+    const pendingLabels = normalizedItems
+        .filter(item => !item.ready)
+        .map(item => item.label);
+
+    let summaryNote = '暂无链路状态';
+    if (totalCount > 0 && pendingLabels.length === 0) {
+        summaryNote = '四条关键链路均已就绪';
+    } else if (totalCount > 0 && pendingLabels.length === totalCount) {
+        summaryNote = '四条关键链路均未就绪';
+    } else if (pendingLabels.length > 0) {
+        summaryNote = `待处理：${pendingLabels.join(' / ')}`;
+    }
+
+    return `
+        <div class="account-diagnostics-readiness-summary">
+            <div class="account-diagnostics-readiness-hero">
+                <div class="account-diagnostics-readiness-ratio">
+                    <span class="account-diagnostics-readiness-ratio-current">${readyCount}</span>
+                    <span class="account-diagnostics-readiness-ratio-total">/ ${totalCount}</span>
+                </div>
+                <div class="account-diagnostics-readiness-caption">关键链路已就绪</div>
+            </div>
+            <div class="account-diagnostics-readiness-progress" aria-hidden="true">
+                <span class="account-diagnostics-readiness-progress-bar" style="width: ${progressPercent}%"></span>
+            </div>
+            <div class="account-diagnostics-readiness-percent">${progressPercent}% 就绪</div>
+            <div class="account-diagnostics-readiness-list">
+                ${normalizedItems.map(item => `
+                <span class="account-diagnostics-readiness-chip ${item.ready ? 'is-ready' : 'is-pending'}">
+                    <span class="account-diagnostics-readiness-name-wrap">
+                        <span class="account-diagnostics-readiness-dot"></span>
+                        <span class="account-diagnostics-readiness-name">${escapeHtml(item.label)}</span>
+                    </span>
+                    <span class="account-diagnostics-readiness-state">${item.ready ? '已就绪' : '未就绪'}</span>
+                </span>
+                `).join('')}
+            </div>
+            <div class="account-diagnostics-readiness-summary-note">${escapeHtml(summaryNote)}</div>
+        </div>
+    `;
+}
+
+function renderAboutAccountMeta(account) {
+    const { accountMeta } = getAboutDiagnosticsElements();
+    if (!accountMeta) return;
+
+    if (!account) {
+        accountMeta.innerHTML = '';
+        return;
+    }
+
+    const metaParts = [
+        buildAboutMetaCard({
+            label: '账号 ID',
+            value: account.id,
+        }),
+        buildAboutMetaCard({
+            label: '登录名',
+            value: account.username || '未设置用户名',
+            supporting: account.username ? '用于账号识别与后续 Cookie 刷新' : '建议补充用户名，便于后续维护',
+        }),
+        buildAboutMetaCard({
+            label: '备注',
+            value: account.remark || '未设置备注',
+            supporting: account.remark ? '' : '可在账号管理中补充备注',
+        }),
+    ];
+
+    accountMeta.innerHTML = metaParts.join('');
+}
+
+function renderAboutDiagnosticsPlaceholder(container, icon, title, subtitle) {
+    if (!container) return;
+
+    container.innerHTML = `
+        <div class="about-placeholder">
+            <i class="bi bi-${icon}"></i>
+            <div>
+                <div class="about-placeholder-title">${escapeHtml(title)}</div>
+                <div class="about-placeholder-sub">${escapeHtml(subtitle)}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderAboutRuntimePlaceholder(title, subtitle) {
+    const { statusContainer } = getAboutDiagnosticsElements();
+    renderAboutDiagnosticsPlaceholder(statusContainer, 'hdd-network', title, subtitle);
+}
+
+function renderAboutHistoryPlaceholder(title, subtitle) {
+    const { historyContainer } = getAboutDiagnosticsElements();
+    renderAboutDiagnosticsPlaceholder(historyContainer, 'clock-history', title, subtitle);
+}
+
+function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
+    if (!runtimeStatus?.running) {
+        return {
+            tone: 'danger',
+            title: '实例未启动',
+            note: '轻保活和历史消息查询都依赖账号实例，当前应先启动实例。',
+        };
+    }
+
+    if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
+        return {
+            tone: 'info',
+            title: '连接正在恢复',
+            note: '主链路还在波动，先观察连接状态与最近消息时间是否继续推进。',
+        };
+    }
+
+    if (!runtimeStatus?.ws_ready || !runtimeStatus?.session_ready || !runtimeStatus?.has_current_token || !runtimeStatus?.message_stream_ready) {
+        return {
+            tone: 'warning',
+            title: `${readinessCount} / 4 关键链路已就绪`,
+            note: '链路部分可用，优先处理未就绪项，再观察保活与消息链路。',
+        };
+    }
+
+    return {
+        tone: 'success',
+        title: '链路稳定可用',
+        note: '连接、轻保活、Token 与业务消息流四条主信号都处于正常状态。',
+    };
+}
+
+function renderAboutRuntimeStatus(runtimeStatus) {
+    const { statusContainer } = getAboutDiagnosticsElements();
+    if (!statusContainer) return;
+
+    if (!runtimeStatus) {
+        renderAboutRuntimePlaceholder('暂无运行态', '当前账号还没有可用的运行态信息。');
+        return;
+    }
+
+    const lastConnectionDisplay = formatAboutRuntimeTime(
+        runtimeStatus.last_successful_connection_at_display,
+        runtimeStatus.last_successful_connection_at
+    );
+    const keepaliveDisplay = formatAboutRuntimeTime(
+        runtimeStatus.session_keepalive_at_display,
+        runtimeStatus.session_keepalive_at
+    );
+    const tokenRefreshDisplay = formatAboutRuntimeTime(
+        runtimeStatus.token_last_refreshed_at_display,
+        runtimeStatus.token_last_refreshed_at
+    );
+    const lastMessageDisplay = formatAboutRuntimeTime(
+        runtimeStatus.last_message_received_at_display,
+        runtimeStatus.last_message_received_at
+    );
+    const stateChangedDisplay = formatAboutRuntimeTime(
+        runtimeStatus.state_last_changed_at_display,
+        runtimeStatus.state_last_changed_at
+    );
+    const messageStreamDisplay = getMessageStreamRuntimeDisplay(runtimeStatus);
+    const messageStreamStatus = messageStreamDisplay.status;
+    const readinessItems = [
+        { label: '实例', ready: !!runtimeStatus.running },
+        { label: 'WS', ready: !!runtimeStatus.ws_ready },
+        { label: 'Session', ready: !!runtimeStatus.session_ready },
+        { label: 'Token', ready: !!runtimeStatus.has_current_token },
+        { label: '业务流', ready: !!runtimeStatus.message_stream_ready },
+    ];
+    const readinessSignalItems = readinessItems.slice(1);
+    const readinessSignalCount = readinessSignalItems.filter(item => item.ready).length;
+    const overview = getAboutRuntimeOverview(runtimeStatus, readinessSignalCount);
+    const connectionTone = getAboutStatusVariant('connection', runtimeStatus.connection_state);
+    const keepaliveDisplayStatus = runtimeStatus.session_keepalive_display_status || runtimeStatus.session_keepalive_status;
+    const keepaliveTone = getAboutStatusVariant('keepalive', keepaliveDisplayStatus);
+    const tokenTone = getAboutStatusVariant('token', runtimeStatus.token_refresh_status);
+    const messageStreamTone = getAboutStatusVariant('stream', messageStreamStatus);
+    const readinessTone = readinessSignalItems.every(item => item.ready)
+        ? 'success'
+        : readinessSignalItems.some(item => item.ready)
+            ? 'warning'
+            : 'danger';
+
+    statusContainer.innerHTML = `
+        <div class="account-diagnostics-status-shell">
+            <div class="account-diagnostics-status-note-bar is-${overview.tone}">
+                <div class="account-diagnostics-status-note-title">${escapeHtml(overview.title)}</div>
+                <div class="account-diagnostics-status-note-text">${escapeHtml(overview.note)}</div>
+            </div>
+            <div class="account-diagnostics-status-body">
+                <div class="account-diagnostics-status-primary">
+                    <div class="account-diagnostics-status-grid">
+                        ${buildAboutRuntimeStatusItem({
+                            label: '连接状态',
+                            value: buildAboutStatusBadge('connection', runtimeStatus.connection_state),
+                            note: `最近连接成功：${lastConnectionDisplay}`,
+                            tone: connectionTone,
+                            richValue: true,
+                            accent: 'connection',
+                            icon: 'hdd-network',
+                        })}
+                        ${buildAboutRuntimeStatusItem({
+                            label: '轻保活状态',
+                            value: buildAboutStatusBadge('keepalive', keepaliveDisplayStatus),
+                            note: runtimeStatus.session_keepalive_display_note
+                                ? `最近执行：${keepaliveDisplay} · ${runtimeStatus.session_keepalive_display_note}`
+                                : `最近执行：${keepaliveDisplay}`,
+                            tone: keepaliveTone,
+                            richValue: true,
+                            accent: 'keepalive',
+                            icon: 'heart-pulse',
+                        })}
+                        ${buildAboutRuntimeStatusItem({
+                            label: 'Token 刷新状态',
+                            value: buildAboutStatusBadge('token', runtimeStatus.token_refresh_status),
+                            note: `最近刷新：${tokenRefreshDisplay}`,
+                            tone: tokenTone,
+                            richValue: true,
+                            accent: 'token',
+                            icon: 'key',
+                        })}
+                        ${buildAboutRuntimeStatusItem({
+                            label: '业务消息流',
+                            value: buildAboutStatusBadge('stream', messageStreamStatus),
+                            note: messageStreamDisplay.note,
+                            tone: messageStreamTone,
+                            richValue: true,
+                            accent: 'readiness',
+                            icon: 'broadcast-pin',
+                        })}
+                    </div>
+                </div>
+                <div class="account-diagnostics-status-sidebar">
+                    ${buildAboutRuntimeStatusItem({
+                        label: '链路就绪情况',
+                        value: buildAboutReadinessValue(readinessSignalItems),
+                        tone: readinessTone,
+                        richValue: true,
+                        accent: 'readiness',
+                        icon: 'diagram-3',
+                    })}
+                </div>
+            </div>
+            <div class="account-diagnostics-status-meta">
+                ${buildAboutRuntimeMetaItem('最近收到消息', lastMessageDisplay)}
+                ${buildAboutRuntimeMetaItem('状态变化时间', stateChangedDisplay)}
+            </div>
+        </div>
+    `;
+}
+
+function getAboutHistoryMessageText(message) {
+    if (message == null) {
+        return '空消息';
+    }
+
+    if (typeof message === 'string') {
+        return message;
+    }
+
+    if (typeof message?.text?.text === 'string' && message.text.text.trim()) {
+        return message.text.text;
+    }
+
+    if (typeof message?.raw === 'string' && message.raw.trim()) {
+        return message.raw;
+    }
+
+    try {
+        return JSON.stringify(message, null, 2);
+    } catch (error) {
+        return String(message);
+    }
+}
+
+function getAboutHistorySenderInitial(senderName) {
+    const normalized = String(senderName || '').trim();
+    if (!normalized) {
+        return 'U';
+    }
+    return normalized.charAt(0).toUpperCase();
+}
+
+function renderAboutConversationHistory(messages, meta = {}) {
+    const { historyContainer } = getAboutDiagnosticsElements();
+    if (!historyContainer) return;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        renderAboutHistoryPlaceholder('未查询到历史消息', '确认会话 ID 是否正确，以及该账号实例是否正在运行。');
+        return;
+    }
+
+    const summaryText = `共查询到 ${messages.length} 条消息`;
+    const conversationIdText = meta.conversationId ? `会话 ID: ${meta.conversationId}` : '';
+
+    historyContainer.innerHTML = `
+        <div class="about-history-summary">
+            <span class="about-history-summary-main">${escapeHtml(summaryText)}</span>
+            ${conversationIdText ? `<span class="about-history-summary-meta">${escapeHtml(conversationIdText)}</span>` : ''}
+        </div>
+        <div class="about-history-items">
+            ${messages.map((item, index) => {
+                const senderName = item?.send_user_name || '未知用户';
+                const senderId = item?.send_user_id || '-';
+                const senderInitial = getAboutHistorySenderInitial(senderName);
+                const messageText = getAboutHistoryMessageText(item?.message);
+                const rawText = typeof item?.message === 'object'
+                    ? (() => {
+                        try {
+                            return JSON.stringify(item.message, null, 2);
+                        } catch (error) {
+                            return messageText;
+                        }
+                    })()
+                    : messageText;
+
+                return `
+                    <div class="about-history-item">
+                        <div class="about-history-item-header">
+                            <div class="about-history-sender-block">
+                                <div class="about-history-sender-row">
+                                    <span class="about-history-sender-avatar">${escapeHtml(senderInitial)}</span>
+                                    <div class="about-history-sender-meta">
+                                        <div class="about-history-sender">${escapeHtml(senderName)}</div>
+                                        <div class="about-history-sender-id">发送者 ID: ${escapeHtml(senderId)}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="about-history-index">第 ${index + 1} 条</div>
+                        </div>
+                        <div class="about-history-message-shell">
+                            <div class="about-history-message">${escapeHtml(messageText)}</div>
+                        </div>
+                        ${rawText !== messageText ? `
+                            <details class="about-history-raw">
+                                <summary>查看原始内容</summary>
+                                <pre>${escapeHtml(rawText)}</pre>
+                            </details>
+                        ` : ''}
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
+function populateAboutAccountOptions(accounts) {
+    const { accountSelect } = getAboutDiagnosticsElements();
+    if (!accountSelect) return;
+
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+        accountSelect.innerHTML = '<option value="">暂无账号</option>';
+        accountSelect.disabled = true;
+        return;
+    }
+
+    accountSelect.disabled = false;
+    accountSelect.innerHTML = `
+        <option value="">请选择账号</option>
+        ${accounts.map(account => {
+            const runningSuffix = account.runtime_status?.running ? ' · 运行中' : '';
+            return `<option value="${escapeHtml(account.id)}">${escapeHtml(account.id + runningSuffix)}</option>`;
+        }).join('')}
+    `;
+}
+
+async function loadAboutRuntimeStatus(accountId = '') {
+    const normalizedAccountId = String(accountId || getAboutSelectedAccountId()).trim();
+    if (!normalizedAccountId) {
+        renderAboutAccountMeta(null);
+        renderAboutRuntimePlaceholder('请选择账号', '选择账号后会显示当前连接状态、轻保活结果和最近活动时间。');
+        return;
+    }
+
+    const selectedAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId) || null;
+    renderAboutAccountMeta(selectedAccount);
+    renderAboutRuntimeStatus(selectedAccount?.runtime_status || null);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(normalizedAccountId)}/runtime-status`);
+        const runtimeStatus = result?.runtime_status || null;
+        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId);
+        if (targetAccount) {
+            targetAccount.runtime_status = runtimeStatus;
+            renderAboutAccountMeta(targetAccount);
+        }
+        renderAboutRuntimeStatus(runtimeStatus);
+        scheduleAboutRuntimeAutoRetry(normalizedAccountId, runtimeStatus);
+    } catch (error) {
+        console.error('加载账号运行态失败:', error);
+    }
+}
+
+async function loadAboutDiagnostics() {
+    initAboutDiagnosticsEvents();
+
+    try {
+        const previousAccountId = getAboutSelectedAccountId();
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];
+        populateAboutAccountOptions(aboutDiagnosticsAccounts);
+
+        const { accountSelect } = getAboutDiagnosticsElements();
+        if (!accountSelect || aboutDiagnosticsAccounts.length === 0) {
+            renderAboutAccountMeta(null);
+            renderAboutRuntimePlaceholder('暂无账号', '请先在账号管理中添加闲鱼账号。');
+            renderAboutHistoryPlaceholder('暂无历史消息', '请先添加账号并确保实例已启动。');
+            return;
+        }
+
+        const nextAccountId = aboutDiagnosticsAccounts.some(account => account.id === previousAccountId)
+            ? previousAccountId
+            : (aboutDiagnosticsAccounts.find(account => account.runtime_status?.running)?.id || aboutDiagnosticsAccounts[0]?.id || '');
+
+        accountSelect.value = nextAccountId;
+        await loadAboutRuntimeStatus(nextAccountId);
+    } catch (error) {
+        console.error('加载账号保活诊断失败:', error);
+    }
+}
+
+async function refreshAboutDiagnosticsStatus() {
+    const { refreshButton } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    const originalHtml = refreshButton?.innerHTML;
+    if (refreshButton) {
+        refreshButton.disabled = true;
+        refreshButton.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>刷新中...';
+    }
+
+    try {
+        await loadAboutRuntimeStatus(accountId);
+        showToast(`账号 "${accountId}" 运行态已刷新`, 'success');
+    } finally {
+        if (refreshButton) {
+            refreshButton.disabled = false;
+            refreshButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function triggerAboutSessionKeepalive() {
+    const { keepaliveButton } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    const originalHtml = keepaliveButton?.innerHTML;
+    if (keepaliveButton) {
+        keepaliveButton.disabled = true;
+        keepaliveButton.innerHTML = '<i class="bi bi-lightning-charge-fill me-1"></i>执行中...';
+    }
+
+    try {
+        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(accountId)}/session-keepalive`, {
+            method: 'POST',
+        });
+        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === accountId);
+        if (targetAccount) {
+            targetAccount.runtime_status = result?.runtime_status || null;
+            renderAboutAccountMeta(targetAccount);
+        }
+        renderAboutRuntimeStatus(result?.runtime_status || null);
+        showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');
+    } catch (error) {
+        console.error('执行轻保活失败:', error);
+    } finally {
+        if (keepaliveButton) {
+            keepaliveButton.disabled = false;
+            keepaliveButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function loadAboutConversationHistory() {
+    const { historyButton, conversationInput } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    const conversationId = conversationInput?.value?.trim() || '';
+
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    if (!conversationId) {
+        showToast('请输入会话 ID', 'warning');
+        return;
+    }
+
+    const originalHtml = historyButton?.innerHTML;
+    if (historyButton) {
+        historyButton.disabled = true;
+        historyButton.innerHTML = '<i class="bi bi-chat-left-text-fill me-1"></i>查询中...';
+    }
+
+    renderAboutHistoryPlaceholder('正在查询历史消息', '请稍候，系统正在尝试拉取最近的会话消息。');
+
+    try {
+        const result = await fetchJSON(
+            `${apiBase}/cookies/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`
+        );
+        renderAboutConversationHistory(result?.messages || [], {
+            conversationId: result?.conversation_id || conversationId,
+        });
+        showToast(`账号 "${accountId}" 历史消息查询完成`, 'success');
+    } catch (error) {
+        console.error('查询历史消息失败:', error);
+        renderAboutHistoryPlaceholder('历史消息查询失败', error?.message || '请稍后重试。');
+    } finally {
+        if (historyButton) {
+            historyButton.disabled = false;
+            historyButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+function initAboutDiagnosticsEvents() {
+    if (aboutDiagnosticsInitialized) {
+        return;
+    }
+
+    const {
+        accountSelect,
+        refreshButton,
+        keepaliveButton,
+        historyButton,
+        conversationInput,
+    } = getAboutDiagnosticsElements();
+
+    accountSelect?.addEventListener('change', async () => {
+        renderAboutHistoryPlaceholder('暂无历史消息', '切换账号后，请重新输入会话 ID 并查询历史消息。');
+        await loadAboutRuntimeStatus(accountSelect.value);
+    });
+
+    refreshButton?.addEventListener('click', refreshAboutDiagnosticsStatus);
+    keepaliveButton?.addEventListener('click', triggerAboutSessionKeepalive);
+    historyButton?.addEventListener('click', loadAboutConversationHistory);
+    conversationInput?.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            loadAboutConversationHistory();
+        }
+    });
+
+    aboutDiagnosticsInitialized = true;
+}
+
+// ================================
 // 【账号管理菜单】相关功能
 // ================================
 
@@ -2716,7 +4045,7 @@ async function loadCookies() {
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
         <tr>
-            <td colspan="10" class="text-center py-4 text-muted empty-state">
+            <td colspan="11" class="text-center py-4 text-muted empty-state">
             <i class="bi bi-inbox fs-1 d-block mb-3"></i>
             <h5>暂无账号</h5>
             <p class="mb-0">请添加新的闲鱼账号开始使用</p>
@@ -2877,7 +4206,7 @@ async function loadCookies() {
         </td>
         <td class="align-middle">
             <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="人脸验证">
+            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="验证截图">
                 <i class="bi bi-shield-check"></i>
             </button>
             <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
@@ -2925,6 +4254,9 @@ async function loadCookies() {
     // 错误已在fetchJSON中处理
     } finally {
     toggleLoading(false);
+    if (document.getElementById('accounts-section')?.classList.contains('active')) {
+        loadAboutDiagnostics();
+    }
     }
 }
 
@@ -4053,6 +5385,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSidebarCollapse();
     // 初始化暗色模式
     initDarkMode();
+    // 初始化账号保活诊断事件
+    initAboutDiagnosticsEvents();
     // 加载系统版本号
     loadSystemVersion();
     // 加载防抖延迟设置
@@ -5620,14 +6954,15 @@ const templatePreviewData = {
     },
     slider_success: {
         account_id: 'test_account',
-        time: new Date().toLocaleString('zh-CN')
+        time: new Date().toLocaleString('zh-CN'),
+        status_text: 'cookies已自动更新到数据库'
     },
     face_verify: {
         account_id: 'test_account',
         time: new Date().toLocaleString('zh-CN'),
         verification_action: '请点击验证链接完成验证:',
         verification_url: 'https://passport.goofish.com/mini_login.htm?example=test',
-        verification_type: '人脸验证'
+        verification_type: '身份验证'
     },
     password_login_success: {
         account_id: 'test_account',
@@ -10574,10 +11909,14 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     updateRefreshCookieStatus('正在登录中，请稍候...');
                     break;
                 case 'verification_required':
-                    // 需要人脸认证，显示验证截图或链接
-                    updateRefreshCookieStatus('需要人脸验证，请查看弹出的验证窗口');
+                    // 需要身份验证，显示验证截图或链接
+                    updateRefreshCookieStatus(`需要${getPasswordLoginVerificationTypeLabel(data.verification_type)}，请查看弹出的验证窗口`);
                     // 使用账号密码登录的验证显示函数
-                    showPasswordLoginQRCode(data.screenshot_path || data.verification_url || data.qr_code_url, data.screenshot_path);
+                    showPasswordLoginQRCode(
+                        data.screenshot_path || data.verification_url || data.qr_code_url,
+                        data.screenshot_path,
+                        data.verification_type
+                    );
                     break;
                 case 'success':
                     stopRefreshCookiePolling(sessionId);
@@ -10723,8 +12062,12 @@ async function checkPasswordLoginStatus() {
                     // 处理中，继续等待
                     break;
                 case 'verification_required':
-                    // 需要人脸认证，显示验证截图或链接
-                    showPasswordLoginQRCode(data.screenshot_path || data.verification_url || data.qr_code_url, data.screenshot_path);
+                    // 需要身份验证，显示验证截图或链接
+                    showPasswordLoginQRCode(
+                        data.screenshot_path || data.verification_url || data.qr_code_url,
+                        data.screenshot_path,
+                        data.verification_type
+                    );
                     // 继续监控（人脸认证后需要继续等待登录完成）
                     break;
                 case 'success':
@@ -10781,8 +12124,19 @@ async function checkPasswordLoginStatus() {
     }
 }
 
-// 显示账号密码登录验证（人脸认证）
-function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
+function getPasswordLoginVerificationTypeLabel(verificationType) {
+    const normalized = String(verificationType || '').trim();
+    const labelMap = {
+        face_verify: '人脸验证',
+        sms_verify: '短信验证',
+        qr_verify: '二维码验证',
+        unknown: '身份验证'
+    };
+    return labelMap[normalized] || normalized || '身份验证';
+}
+
+// 显示账号密码登录验证
+function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType) {
     // 使用现有的二维码登录模态框
     let modal = document.getElementById('passwordLoginQRModal');
     if (!modal) {
@@ -10814,12 +12168,14 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
     const screenshotImg = document.getElementById('passwordLoginScreenshotImg');
     const linkButton = document.getElementById('passwordLoginVerificationLink');
     const statusText = document.getElementById('passwordLoginQRStatusText');
+    const verificationTypeLabel = getPasswordLoginVerificationTypeLabel(verificationType);
     
     if (screenshotPath) {
         // 显示截图
         if (screenshotImg) {
             screenshotImg.src = `${normalizeStaticAssetPath(screenshotPath)}?t=${new Date().getTime()}`;
             screenshotImg.style.display = 'block';
+            screenshotImg.alt = `${verificationTypeLabel}截图`;
         }
         
         // 隐藏链接按钮
@@ -10829,7 +12185,9 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = '需要闲鱼人脸验证，请使用手机闲鱼APP扫描下方二维码完成验证';
+            statusText.textContent = verificationTypeLabel === '二维码验证'
+                ? '需要闲鱼二维码验证，请使用手机闲鱼APP扫描下方二维码完成验证'
+                : `需要闲鱼${verificationTypeLabel}，请根据下方验证信息在手机闲鱼APP中完成操作`;
         }
     } else if (verificationUrl) {
         // 隐藏截图
@@ -10845,7 +12203,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = '服务端已保持原始会话；如二维码暂未显示，可使用下方兜底入口';
+            statusText.textContent = `服务端已保持原始会话；如${verificationTypeLabel}入口暂未显示，可使用下方兜底入口`;
         }
     } else {
         // 都没有，显示等待
@@ -10856,7 +12214,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
             linkButton.style.display = 'none';
         }
         if (statusText) {
-            statusText.textContent = '需要闲鱼验证，请等待验证信息...';
+            statusText.textContent = `需要闲鱼${verificationTypeLabel}，请等待验证信息...`;
         }
     }
 }
@@ -10886,7 +12244,7 @@ function closePasswordLoginQRModal() {
 
     const statusText = document.getElementById('passwordLoginQRStatusText');
     if (statusText) {
-        statusText.textContent = '需要闲鱼人脸验证，请等待验证信息...';
+        statusText.textContent = '需要闲鱼身份验证，请等待验证信息...';
     }
 
     const modalInstance = bootstrap.Modal.getInstance(modalElement);
@@ -10916,12 +12274,12 @@ function createPasswordLoginQRModal() {
                     </div>
                     <div class="modal-body text-center">
                         <p id="passwordLoginQRStatusText" class="text-muted mb-3">
-                            需要闲鱼人脸验证，请等待验证信息...
+                            需要闲鱼身份验证，请等待验证信息...
                         </p>
                         
                         <!-- 截图显示区域 -->
                         <div id="passwordLoginScreenshotContainer" class="mb-3 d-flex justify-content-center">
-                            <img id="passwordLoginScreenshotImg" src="" alt="人脸验证二维码" 
+                            <img id="passwordLoginScreenshotImg" src="" alt="验证截图" 
                                  class="img-fluid" style="display: none; max-width: 400px; height: auto; border: 2px solid #ddd; border-radius: 8px;">
                         </div>
                         
@@ -12825,30 +14183,12 @@ async function loadOrderCookieFilter() {
         const select = document.getElementById('orderCookieFilter');
         const previousValue = select ? select.value : '';
 
-        const response = await fetch(`${apiBase}/api/orders`, {
-            headers: {
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
+        const accounts = await fetchOrderSyncAccounts(true);
+        if (select) {
+            renderOrderAccountOptions(select, accounts, { includeAllOption: true });
 
-        const data = await response.json();
-        if (data.success && data.data) {
-            // 提取唯一的cookie_id
-            const cookieIds = [...new Set(data.data.map(order => order.cookie_id).filter(id => id))];
-
-            if (select) {
-                select.innerHTML = '<option value="">所有账号</option>';
-
-                cookieIds.forEach(cookieId => {
-                    const option = document.createElement('option');
-                    option.value = cookieId;
-                    option.textContent = cookieId;
-                    select.appendChild(option);
-                });
-
-                if (previousValue && cookieIds.includes(previousValue)) {
-                    select.value = previousValue;
-                }
+            if (previousValue && accounts.some(account => account.id === previousValue)) {
+                select.value = previousValue;
             }
         }
     } catch (error) {
@@ -12868,10 +14208,10 @@ async function loadAllOrders() {
         const data = await response.json();
         if (data.success) {
             allOrdersData = data.data || [];
-            // 按创建时间倒序排列
+            // 历史同步后优先按平台下单时间排序，回退到入库时间
             allOrdersData.sort((a, b) => {
-                const bTime = parseUtcDateTime(b.created_at)?.getTime() || 0;
-                const aTime = parseUtcDateTime(a.created_at)?.getTime() || 0;
+                const bTime = parseUtcDateTime(getOrderPrimarySortTime(b))?.getTime() || 0;
+                const aTime = parseUtcDateTime(getOrderPrimarySortTime(a))?.getTime() || 0;
                 return bTime - aTime;
             });
 
@@ -13206,6 +14546,490 @@ async function refreshOrders() {
     showToast('订单列表已刷新', 'success');
 }
 
+function getOrderPrimarySortTime(order) {
+    const platformCreatedAt = String(order?.platform_created_at || '').trim();
+    if (platformCreatedAt) {
+        return platformCreatedAt;
+    }
+
+    const createdAt = String(order?.created_at || '').trim();
+    return createdAt || null;
+}
+
+function getRelativeBeijingDateInputValue(offsetDays = 0) {
+    return getBeijingDateKey(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000));
+}
+
+async function fetchOrderSyncAccounts(forceRefresh = false) {
+    if (!forceRefresh && orderHistorySyncAccounts.length > 0) {
+        return orderHistorySyncAccounts;
+    }
+
+    const response = await fetch(`${apiBase}/cookies/details`, {
+        headers: {
+            'Authorization': `Bearer ${authToken}`
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`获取账号列表失败: HTTP ${response.status}`);
+    }
+
+    const accounts = await response.json();
+    orderHistorySyncAccounts = Array.isArray(accounts) ? accounts : [];
+    return orderHistorySyncAccounts;
+}
+
+function formatOrderAccountLabel(account) {
+    const accountId = String(account?.id || '').trim();
+    const remark = String(account?.remark || '').trim();
+    if (remark) {
+        return `${remark} (${accountId})`;
+    }
+    return accountId || '未命名账号';
+}
+
+function renderOrderAccountOptions(select, accounts, options = {}) {
+    if (!select) return;
+
+    const {
+        includeAllOption = false,
+        allOptionLabel = '所有账号',
+    } = options;
+
+    const previousValue = select.value;
+    select.innerHTML = includeAllOption ? `<option value="">${allOptionLabel}</option>` : '';
+
+    (accounts || []).forEach(account => {
+        const accountId = String(account?.id || '').trim();
+        if (!accountId) return;
+
+        const option = document.createElement('option');
+        option.value = accountId;
+        option.textContent = formatOrderAccountLabel(account);
+        select.appendChild(option);
+    });
+
+    if (previousValue && Array.from(select.options).some(option => option.value === previousValue)) {
+        select.value = previousValue;
+    }
+}
+
+function resetOrderHistorySyncProgress() {
+    renderOrderHistorySyncJob({
+        status: 'idle',
+        message: '选择账号和日期范围后即可开始同步。',
+        request: {},
+        accounts_total: 0,
+        accounts_completed: 0,
+        orders_discovered: 0,
+        orders_processed: 0,
+        orders_saved: 0,
+        orders_skipped: 0,
+        orders_failed: 0,
+        matched_orders: 0,
+        warnings: [],
+    });
+}
+
+function setOrderHistorySyncFormDisabled(disabled) {
+    [
+        'orderHistorySyncCookieId',
+        'orderHistorySyncStartDate',
+        'orderHistorySyncEndDate',
+        'orderHistorySyncMaxOrders',
+        'orderHistorySyncFetchDetails',
+    ].forEach(id => {
+        const element = document.getElementById(id);
+        if (element) {
+            element.disabled = disabled;
+        }
+    });
+
+    const startBtn = document.getElementById('orderHistorySyncStartBtn');
+    const cancelBtn = document.getElementById('orderHistorySyncCancelBtn');
+    if (startBtn) {
+        startBtn.disabled = disabled;
+        startBtn.innerHTML = disabled
+            ? '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>同步中'
+            : '<i class="bi bi-play-circle"></i> 开始同步';
+    }
+    if (cancelBtn) {
+        cancelBtn.style.display = disabled ? '' : 'none';
+        cancelBtn.disabled = false;
+    }
+}
+
+function stopOrderHistorySyncPolling() {
+    if (orderHistorySyncPollingTimer) {
+        clearTimeout(orderHistorySyncPollingTimer);
+        orderHistorySyncPollingTimer = null;
+    }
+}
+
+function scheduleOrderHistorySyncPolling(jobId) {
+    stopOrderHistorySyncPolling();
+    orderHistorySyncPollingTimer = setTimeout(() => {
+        fetchOrderHistorySyncStatus(jobId).catch(error => {
+            console.error('轮询历史订单同步状态失败:', error);
+        });
+    }, 2000);
+}
+
+function getOrderHistorySyncStatusMeta(job) {
+    const status = String(job?.status || '').toLowerCase();
+    const statusMap = {
+        idle: { label: '待命', badgeClass: 'bg-secondary text-white', progressClass: 'bg-secondary', title: '未开始' },
+        pending: { label: '排队中', badgeClass: 'bg-secondary text-white', progressClass: 'bg-secondary', title: '等待执行' },
+        running: { label: '进行中', badgeClass: 'bg-primary text-white', progressClass: 'bg-primary', title: '同步中' },
+        completed: { label: '已完成', badgeClass: 'bg-success text-white', progressClass: 'bg-success', title: '同步完成' },
+        failed: { label: '失败', badgeClass: 'bg-danger text-white', progressClass: 'bg-danger', title: '同步失败' },
+        cancelled: { label: '已取消', badgeClass: 'bg-warning text-dark', progressClass: 'bg-warning', title: '同步已取消' },
+    };
+    return statusMap[status] || statusMap.idle;
+}
+
+function renderOrderHistorySyncJob(job) {
+    const statusMeta = getOrderHistorySyncStatusMeta(job);
+    const request = job?.request || {};
+    const accountsTotal = Number(job?.accounts_total || 0);
+    const accountsCompleted = Number(job?.accounts_completed || 0);
+    const ordersDiscovered = Number(job?.orders_discovered || 0);
+    const matchedOrders = Number(job?.matched_orders || 0);
+    const ordersSaved = Number(job?.orders_saved || 0);
+    const ordersFailed = Number(job?.orders_failed || 0);
+    const ordersProcessed = Number(job?.orders_processed || 0);
+    const ordersSkipped = Number(job?.orders_skipped || 0);
+    const warnings = Array.isArray(job?.warnings) ? job.warnings : [];
+
+    const statusText = document.getElementById('orderHistorySyncStatusText');
+    const messageText = document.getElementById('orderHistorySyncMessageText');
+    const statusBadge = document.getElementById('orderHistorySyncStatusBadge');
+    const progressBar = document.getElementById('orderHistorySyncProgressBar');
+    const accountsStat = document.getElementById('orderHistorySyncAccountsStat');
+    const discoveredStat = document.getElementById('orderHistorySyncDiscoveredStat');
+    const matchedStat = document.getElementById('orderHistorySyncMatchedStat');
+    const savedStat = document.getElementById('orderHistorySyncSavedStat');
+    const metaText = document.getElementById('orderHistorySyncMetaText');
+    const currentText = document.getElementById('orderHistorySyncCurrentText');
+    const warningsWrap = document.getElementById('orderHistorySyncWarningsWrap');
+    const warningsContainer = document.getElementById('orderHistorySyncWarnings');
+    const cookieSelect = document.getElementById('orderHistorySyncCookieId');
+    const startDateInput = document.getElementById('orderHistorySyncStartDate');
+    const endDateInput = document.getElementById('orderHistorySyncEndDate');
+    const maxOrdersInput = document.getElementById('orderHistorySyncMaxOrders');
+    const fetchDetailsInput = document.getElementById('orderHistorySyncFetchDetails');
+
+    if (cookieSelect && Object.prototype.hasOwnProperty.call(request, 'cookie_id')) {
+        cookieSelect.value = request.cookie_id || '';
+    }
+    if (startDateInput && request.start_date) {
+        startDateInput.value = request.start_date;
+    }
+    if (endDateInput && request.end_date) {
+        endDateInput.value = request.end_date;
+    }
+    if (maxOrdersInput && request.max_orders) {
+        maxOrdersInput.value = String(request.max_orders);
+    }
+    if (fetchDetailsInput && Object.prototype.hasOwnProperty.call(request, 'fetch_details')) {
+        fetchDetailsInput.checked = Boolean(request.fetch_details);
+    }
+
+    if (statusText) {
+        statusText.textContent = statusMeta.title;
+    }
+    if (messageText) {
+        messageText.textContent = job?.message || '选择账号和日期范围后即可开始同步。';
+    }
+    if (statusBadge) {
+        statusBadge.className = `badge ${statusMeta.badgeClass}`;
+        statusBadge.textContent = statusMeta.label;
+    }
+
+    let progressPercent = 0;
+    const status = String(job?.status || '').toLowerCase();
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+        progressPercent = 100;
+    } else if (accountsTotal > 0) {
+        const accountProgress = accountsCompleted / accountsTotal;
+        const orderProgress = matchedOrders > 0 ? (ordersProcessed / matchedOrders) : 0;
+        progressPercent = Math.max(accountProgress, orderProgress) * 100;
+    } else if (status === 'pending') {
+        progressPercent = 8;
+    }
+
+    if (progressBar) {
+        progressBar.className = `progress-bar ${statusMeta.progressClass}`;
+        progressBar.style.width = `${Math.max(0, Math.min(100, progressPercent))}%`;
+    }
+
+    if (accountsStat) {
+        accountsStat.textContent = `${accountsCompleted} / ${accountsTotal}`;
+    }
+    if (discoveredStat) {
+        discoveredStat.textContent = String(ordersDiscovered);
+    }
+    if (matchedStat) {
+        matchedStat.textContent = String(matchedOrders);
+    }
+    if (savedStat) {
+        savedStat.textContent = `${ordersSaved} / ${ordersFailed}`;
+    }
+
+    const requestParts = [
+        request.cookie_id ? `账号 ${request.cookie_id}` : '全部账号',
+        request.max_orders ? `最多同步 ${request.max_orders} 单` : '',
+        request.fetch_details === false ? '仅基础信息' : '含订单详情',
+        request.start_date && request.end_date ? `时间范围 ${request.start_date} 至 ${request.end_date}` : '',
+    ].filter(Boolean);
+    const metaParts = [
+        requestParts.join(' · '),
+        job?.started_at ? `开始于 ${job.started_at}` : '',
+        job?.finished_at ? `结束于 ${job.finished_at}` : '',
+    ].filter(Boolean);
+    if (metaText) {
+        metaText.textContent = metaParts.join(' · ') || '尚未开始任务';
+    }
+
+    const currentParts = [];
+    if (job?.current_account) {
+        currentParts.push(`当前账号: ${job.current_account}`);
+    }
+    if (job?.current_order_id) {
+        currentParts.push(`当前订单: ${job.current_order_id}`);
+    }
+    if (ordersProcessed > 0 || ordersSkipped > 0) {
+        currentParts.push(`已处理 ${ordersProcessed} 单，跳过 ${ordersSkipped} 单`);
+    }
+    if (currentText) {
+        if (matchedOrders > 0 && ordersProcessed > 0) {
+            currentParts.unshift(`范围内进度: ${ordersProcessed} / ${matchedOrders}`);
+        }
+        currentText.textContent = currentParts.join(' · ');
+    }
+
+    if (warningsWrap && warningsContainer) {
+        if (warnings.length > 0) {
+            warningsWrap.style.display = '';
+            warningsContainer.innerHTML = warnings.map(message => `
+                <div class="border rounded-3 bg-white px-3 py-2 text-muted small">
+                    ${escapeHtml(message)}
+                </div>
+            `).join('');
+        } else {
+            warningsWrap.style.display = 'none';
+            warningsContainer.innerHTML = '';
+        }
+    }
+
+    setOrderHistorySyncFormDisabled(status === 'pending' || status === 'running');
+}
+
+async function openOrderHistorySyncModal() {
+    try {
+        const modalElement = document.getElementById('orderHistorySyncModal');
+        if (!modalElement) return;
+
+        orderHistorySyncModalInstance = bootstrap.Modal.getOrCreateInstance(modalElement);
+
+        const accounts = await fetchOrderSyncAccounts(true);
+        const select = document.getElementById('orderHistorySyncCookieId');
+        renderOrderAccountOptions(select, accounts, { includeAllOption: true });
+
+        const pageFilterValue = document.getElementById('orderCookieFilter')?.value || '';
+        const startDateInput = document.getElementById('orderHistorySyncStartDate');
+        const endDateInput = document.getElementById('orderHistorySyncEndDate');
+        const maxOrdersInput = document.getElementById('orderHistorySyncMaxOrders');
+        const fetchDetailsInput = document.getElementById('orderHistorySyncFetchDetails');
+
+        if (startDateInput && !startDateInput.value) {
+            startDateInput.value = getRelativeBeijingDateInputValue(-30);
+        }
+        if (endDateInput && !endDateInput.value) {
+            endDateInput.value = getRelativeBeijingDateInputValue(0);
+        }
+        if (maxOrdersInput && !maxOrdersInput.value) {
+            maxOrdersInput.value = '120';
+        }
+        if (fetchDetailsInput && !activeOrderHistorySyncJobId) {
+            fetchDetailsInput.checked = true;
+        }
+
+        if (select && !activeOrderHistorySyncJobId) {
+            select.value = pageFilterValue || '';
+        }
+
+        if (activeOrderHistorySyncJobId) {
+            try {
+                await fetchOrderHistorySyncStatus(activeOrderHistorySyncJobId, { silentToast: true });
+            } catch (error) {
+                if (activeOrderHistorySyncJobId) {
+                    throw error;
+                }
+            }
+        }
+
+        if (!activeOrderHistorySyncJobId) {
+            resetOrderHistorySyncProgress();
+        }
+
+        orderHistorySyncModalInstance.show();
+    } catch (error) {
+        console.error('打开历史订单同步弹窗失败:', error);
+        showToast('加载历史同步配置失败', 'danger');
+    }
+}
+
+async function startOrderHistorySync() {
+    try {
+        const cookieId = document.getElementById('orderHistorySyncCookieId')?.value || '';
+        const startDate = document.getElementById('orderHistorySyncStartDate')?.value || '';
+        const endDate = document.getElementById('orderHistorySyncEndDate')?.value || '';
+        const maxOrders = parseInt(document.getElementById('orderHistorySyncMaxOrders')?.value || '120', 10);
+        const fetchDetails = Boolean(document.getElementById('orderHistorySyncFetchDetails')?.checked);
+
+        if (!startDate || !endDate) {
+            showToast('请选择开始日期和结束日期', 'warning');
+            return;
+        }
+        if (startDate > endDate) {
+            showToast('开始日期不能晚于结束日期', 'warning');
+            return;
+        }
+        if (!Number.isFinite(maxOrders) || maxOrders < 1 || maxOrders > 500) {
+            showToast('最多同步单数需在 1 到 500 之间', 'warning');
+            return;
+        }
+
+        const startBtn = document.getElementById('orderHistorySyncStartBtn');
+        if (startBtn) {
+            startBtn.disabled = true;
+            startBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>创建任务中';
+        }
+
+        const response = await fetch(`${apiBase}/api/orders/history-sync`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                cookie_id: cookieId || null,
+                start_date: startDate,
+                end_date: endDate,
+                max_orders: maxOrders,
+                fetch_details: fetchDetails,
+            })
+        });
+
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success || !result.data) {
+            throw new Error(result.detail || result.message || '创建历史订单同步任务失败');
+        }
+
+        activeOrderHistorySyncJobId = result.data.job_id;
+        orderHistorySyncNotifiedJobId = '';
+        renderOrderHistorySyncJob(result.data);
+        scheduleOrderHistorySyncPolling(activeOrderHistorySyncJobId);
+        showToast('历史订单同步已开始', 'success');
+    } catch (error) {
+        console.error('创建历史订单同步任务失败:', error);
+        showToast(error.message || '创建历史订单同步任务失败', 'danger');
+        setOrderHistorySyncFormDisabled(false);
+    } finally {
+        const startBtn = document.getElementById('orderHistorySyncStartBtn');
+        if (startBtn && !startBtn.disabled) {
+            startBtn.innerHTML = '<i class="bi bi-play-circle"></i> 开始同步';
+        }
+    }
+}
+
+async function fetchOrderHistorySyncStatus(jobId, options = {}) {
+    if (!jobId) return null;
+
+    const { silentToast = false } = options;
+    const response = await fetch(`${apiBase}/api/orders/history-sync/${jobId}`, {
+        headers: {
+            'Authorization': `Bearer ${authToken}`
+        }
+    });
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success || !result.data) {
+        if (response.status === 404) {
+            activeOrderHistorySyncJobId = '';
+            stopOrderHistorySyncPolling();
+            resetOrderHistorySyncProgress();
+        }
+        throw new Error(result.detail || result.message || '获取历史订单同步状态失败');
+    }
+
+    const job = result.data;
+    activeOrderHistorySyncJobId = job.job_id || activeOrderHistorySyncJobId;
+    renderOrderHistorySyncJob(job);
+
+    const status = String(job?.status || '').toLowerCase();
+    if (status === 'pending' || status === 'running') {
+        scheduleOrderHistorySyncPolling(job.job_id);
+    } else {
+        stopOrderHistorySyncPolling();
+
+        const startBtn = document.getElementById('orderHistorySyncStartBtn');
+        if (startBtn) {
+            startBtn.innerHTML = '<i class="bi bi-play-circle"></i> 开始同步';
+        }
+
+        if (!silentToast && orderHistorySyncNotifiedJobId !== job.job_id) {
+            orderHistorySyncNotifiedJobId = job.job_id;
+            if (status === 'completed') {
+                showToast(job.message || '历史订单同步完成', 'success');
+            } else if (status === 'failed') {
+                showToast(job.error || job.message || '历史订单同步失败', 'danger');
+            } else if (status === 'cancelled') {
+                showToast(job.message || '历史订单同步已取消', 'warning');
+            }
+            await refreshOrdersData();
+        }
+    }
+
+    return job;
+}
+
+async function cancelOrderHistorySync() {
+    if (!activeOrderHistorySyncJobId) {
+        showToast('当前没有可取消的历史同步任务', 'warning');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/api/orders/history-sync/${activeOrderHistorySyncJobId}/cancel`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success || !result.data) {
+            throw new Error(result.detail || result.message || '取消历史订单同步失败');
+        }
+
+        stopOrderHistorySyncPolling();
+        renderOrderHistorySyncJob(result.data);
+        orderHistorySyncNotifiedJobId = result.data.job_id || orderHistorySyncNotifiedJobId;
+        const startBtn = document.getElementById('orderHistorySyncStartBtn');
+        if (startBtn) {
+            startBtn.innerHTML = '<i class="bi bi-play-circle"></i> 开始同步';
+        }
+        showToast(result.data.message || '历史订单同步已取消', 'warning');
+        await refreshOrdersData();
+    } catch (error) {
+        console.error('取消历史订单同步失败:', error);
+        showToast(error.message || '取消历史订单同步失败', 'danger');
+    }
+}
+
 // 清空订单筛选条件
 function clearOrderFilters() {
     const searchInput = document.getElementById('orderSearchInput');
@@ -13241,8 +15065,11 @@ async function showOrderDetail(orderId) {
         const safeSpecValue2 = escapeHtml(order.spec_value_2 || '无');
         const safeQuantity = escapeHtml(order.quantity || '1');
         const safeAmount = escapeHtml(formatOrderAmountDisplay(order.amount));
-        const safeCreatedAt = escapeHtml(formatDateTime(order.created_at));
-        const safeUpdatedAt = escapeHtml(formatDateTime(order.updated_at));
+        const safePlatformCreatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.platform_created_at));
+        const safePlatformPaidAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.platform_paid_at));
+        const safePlatformCompletedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.platform_completed_at));
+        const safeCreatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.created_at));
+        const safeUpdatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.updated_at));
         const safeStatusText = escapeHtml(getOrderStatusText(order.order_status));
 
         const modalContent = `
@@ -13285,7 +15112,10 @@ async function showOrderDetail(orderId) {
                                 <div class="col-12">
                                     <h6>时间信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>创建时间</td><td>${safeCreatedAt}</td></tr>
+                                        <tr><td>平台下单时间</td><td>${safePlatformCreatedAt}</td></tr>
+                                        <tr><td>平台付款时间</td><td>${safePlatformPaidAt}</td></tr>
+                                        <tr><td>平台完成时间</td><td>${safePlatformCompletedAt}</td></tr>
+                                        <tr><td>入库时间</td><td>${safeCreatedAt}</td></tr>
                                         <tr><td>更新时间</td><td>${safeUpdatedAt}</td></tr>
                                     </table>
                                 </div>
@@ -13637,6 +15467,13 @@ document.addEventListener('DOMContentLoaded', function() {
     // 延迟初始化，确保DOM完全加载
     setTimeout(() => {
         initOrdersSearch();
+
+        const orderHistorySyncModal = document.getElementById('orderHistorySyncModal');
+        if (orderHistorySyncModal) {
+            orderHistorySyncModal.addEventListener('hidden.bs.modal', () => {
+                stopOrderHistorySyncPolling();
+            });
+        }
 
         // 绑定复选框变化事件
         document.addEventListener('change', function(e) {
@@ -15049,6 +16886,13 @@ async function loadRiskControlLogs(offset = 0) {
 function getRiskEventCategoryMeta(eventType) {
     const normalizedType = String(eventType || '').trim();
 
+    if (normalizedType === 'unknown') {
+        return {
+            label: '身份验证',
+            className: 'risk-event-category-trigger'
+        };
+    }
+
     if (['slider_captcha', 'face_verify', 'sms_verify', 'qr_verify', 'token_expired'].includes(normalizedType)) {
         return {
             label: '风控触发',
@@ -15864,7 +17708,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.8.2';
+const DEFAULT_VERSION = 'v1.9.2';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -15975,9 +17819,42 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.8.4',
+    version: 'v1.9.2',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.9.2',
+            date: '2026-04-10',
+            updates: [
+                '【修复】运行态总览统一按 WS / Session / Token / 业务流 四条主链路统计，避免出现 1 / 5 与 0 / 4 混用',
+                '【修复】运行态优先读取账号真实活跃实例，临时 XianyuLive 实例不再注册到全局实例表，减少业务消息流误判未就绪',
+                '【优化】账号详情运行态总览调整为左侧四个状态卡、右侧链路就绪摘要卡，桌面端信息分区更清晰',
+                '【优化】业务消息流补充连接未就绪与恢复中的兜底展示，运行态短时异常时前端自动重试刷新更平滑'
+            ]
+        },
+        {
+            version: 'v1.9.1',
+            date: '2026-04-10',
+            updates: [
+                '【新功能】新增业务消息流看门狗，区分心跳包与真实业务包，长时间只有心跳时会主动关闭旧 WebSocket 并触发重连',
+                '【新功能】账号运行态新增消息流诊断字段，补充最近非心跳业务包、同步包、真实买家消息与假在线重连时间，便于识别“连接已通但消息停滞”',
+                '【优化】仪表盘账号卡片和账号详情页新增“消息流”状态，并将链路就绪判断扩展到业务消息流',
+                '【优化】前端对连接中、重连中和短时异常状态增加自动重试刷新，减少运行态展示滞后'
+            ]
+        },
+        {
+            version: 'v1.9.0',
+            date: '2026-04-08',
+            updates: [
+                '【新功能】升级账号保活链路与账号诊断能力，账号页按实际链路展示 WS / Session / Token / 轻保活 等运行状态，仪表盘账号卡片新增运行态摘要',
+                '【新功能】重写历史订单同步并切换卖家工作台接口，补齐订单平台时间字段链路，支持在前端查看同步入口、状态面板与任务进度',
+                '【修复】收紧历史订单同步时间范围与数量限制，降低大范围同步导致的异常与超时风险',
+                '【修复】收紧登录表单识别，找不到账号框/密码框时先复检已登录态和验证页；验证类型不明时不再默认按人脸处理，前后端展示与通知统一按实际验证类型显示',
+                '【修复】修复账号重新启用后资料被清空的问题，避免恢复启用时覆盖已有配置',
+                '【优化】调整自动回复优先级顺序，减少多规则命中时的回复偏差',
+                '【新功能】接入 GitHub 公告栏，仪表盘支持展示公告横幅并可点击查看历史公告记录'
+            ]
+        },
         {
             version: 'v1.8.4',
             date: '2026-04-05',
@@ -17226,9 +19103,9 @@ async function checkCaptchaCompletion(modal, sessionId) {
     });
 }
 
-// ========================= 人脸验证相关功能 =========================
+// ========================= 验证截图相关功能 =========================
 
-// 显示人脸验证截图
+// 显示验证截图
 async function showFaceVerification(accountId) {
     try {
         toggleLoading(true);
@@ -17258,12 +19135,12 @@ async function showFaceVerification(accountId) {
         
     } catch (error) {
         toggleLoading(false);
-        console.error('获取人脸验证截图失败:', error);
+        console.error('获取验证截图失败:', error);
         showToast('获取验证截图失败: ' + error.message, 'danger');
     }
 }
 
-// 显示账号列表的人脸验证弹窗（使用与密码登录相同的样式）
+// 显示账号列表的验证截图弹窗（使用与密码登录相同的样式）
 function showAccountFaceVerificationModal(accountId, screenshot) {
     // 复用密码登录的弹窗
     let modal = document.getElementById('passwordLoginQRModal');
@@ -17275,7 +19152,7 @@ function showAccountFaceVerificationModal(accountId, screenshot) {
     // 更新模态框标题
     const modalTitle = document.getElementById('passwordLoginQRModalLabel');
     if (modalTitle) {
-        modalTitle.innerHTML = `<i class="bi bi-shield-exclamation text-warning me-2"></i>人脸验证 - 账号 ${accountId}`;
+        modalTitle.innerHTML = `<i class="bi bi-shield-exclamation text-warning me-2"></i>账号验证 - 账号 ${accountId}`;
     }
     
     // 显示截图
@@ -17286,6 +19163,7 @@ function showAccountFaceVerificationModal(accountId, screenshot) {
     if (screenshotImg) {
         screenshotImg.src = `${screenshot.path}?t=${new Date().getTime()}`;
         screenshotImg.style.display = 'block';
+        screenshotImg.alt = '验证截图';
     }
     
     // 隐藏链接按钮
@@ -17295,7 +19173,7 @@ function showAccountFaceVerificationModal(accountId, screenshot) {
     
     // 更新状态文本
     if (statusText) {
-        statusText.innerHTML = `需要闲鱼人脸验证，请使用手机闲鱼APP扫描下方二维码完成验证<br><small class="text-muted">创建时间: ${screenshot.created_time_str}</small>`;
+        statusText.innerHTML = `请根据下方验证截图在手机闲鱼APP中完成验证<br><small class="text-muted">创建时间: ${screenshot.created_time_str}</small>`;
     }
     
     // 获取或创建模态框实例
