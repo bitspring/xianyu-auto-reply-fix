@@ -1116,6 +1116,20 @@
   color: var(--secondary-color);
 }
 
+.dashboard-account-status-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.32rem 0.68rem;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #b45309;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  font-size: 0.76rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
 .dashboard-account-main-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1428,6 +1442,12 @@
 [data-theme="dark"] .dashboard-account-status.is-disabled {
   color: #cbd5e1;
   background: rgba(148, 163, 184, 0.16);
+}
+
+[data-theme="dark"] .dashboard-account-status-note {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.28);
 }
 
 [data-theme="dark"] .dashboard-account-summary-detail-value {

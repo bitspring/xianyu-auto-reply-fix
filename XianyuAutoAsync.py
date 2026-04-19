@@ -650,7 +650,7 @@ class XianyuLive:
         message = (error_message or "").lower()
         if any(keyword in message for keyword in ["账号密码错误", "账密错误", "用户名或密码错误", "密码错误"]):
             return "credentials", 1800
-        if any(keyword in message for keyword in ["前置滑块", "风控", "拦截", "框体错误", "点击框体重试"]):
+        if any(keyword in message for keyword in ["前置滑块", "风控", "拦截", "框体错误", "点击框体重试", "账号存在风险", "闲鱼客户端登录"]):
             return "risk_control", 900
         if any(keyword in message for keyword in ["滑块验证失败", "未找到滑块容器"]):
             return "slider_failed", 600
@@ -668,6 +668,58 @@ class XianyuLive:
         if any(keyword in message for keyword in ["网络", "timeout", "cannot connect", "连接", "dns", "ssl"]):
             return "network", 180
         return "unknown", 300
+
+    @staticmethod
+    def _is_account_risk_login_error(error_message: str) -> bool:
+        """识别需要立即停账号保护的高风险登录提示。"""
+        message = str(error_message or "").strip()
+        if not message:
+            return False
+        return "账号存在风险" in message and ("闲鱼客户端登录" in message or "按提示操作" in message)
+
+    async def _protect_account_from_risk_login_retry(self, error_message: str, status_note: str = "风控保护中") -> bool:
+        """命中高风险登录提示后自动禁用账号，避免持续触发更强风控。"""
+        message = str(error_message or "").strip()
+        if not self._is_account_risk_login_error(message):
+            return False
+
+        self.current_token = None
+        self.last_token_refresh_status = "account_risk_protected"
+        self.last_token_refresh_error_message = message
+        XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+
+        try:
+            db_manager.update_cookie_status_note(self.cookie_id, status_note)
+        except Exception as note_e:
+            logger.error(f"【{self.cookie_id}】写入账号状态文案失败: {self._safe_str(note_e)}")
+
+        try:
+            db_manager.save_cookie_status(self.cookie_id, False)
+        except Exception as status_e:
+            logger.error(f"【{self.cookie_id}】持久化账号禁用状态失败: {self._safe_str(status_e)}")
+
+        try:
+            from cookie_manager import manager as cookie_manager_manager
+            if cookie_manager_manager:
+                cookie_manager_manager.cookie_status[self.cookie_id] = False
+                tracked_task = cookie_manager_manager.tasks.get(self.cookie_id)
+                current_task = asyncio.current_task()
+                if tracked_task is current_task:
+                    cookie_manager_manager.tasks.pop(self.cookie_id, None)
+                elif tracked_task and tracked_task.done():
+                    cookie_manager_manager.tasks.pop(self.cookie_id, None)
+        except Exception as cm_e:
+            logger.error(f"【{self.cookie_id}】更新内存账号状态失败: {self._safe_str(cm_e)}")
+
+        self._set_connection_state(ConnectionState.FAILED, "检测到账号风控，已自动禁用")
+        logger.error(
+            f"【{self.cookie_id}】检测到账号高风险登录提示，已自动禁用账号并标记为“{status_note}”，停止后续自动登录重试"
+        )
+        try:
+            await self._force_websocket_reconnect("检测到账号风控，账号已自动禁用")
+        except Exception as reconnect_e:
+            logger.warning(f"【{self.cookie_id}】风控保护触发后关闭WebSocket失败: {self._safe_str(reconnect_e)}")
+        return True
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -6092,7 +6144,7 @@ class XianyuLive:
                                 )
                             
                             if not refresh_success:
-                                if allow_password_login_recovery:
+                                if allow_password_login_recovery and self.last_token_refresh_status != "account_risk_protected":
                                     self.last_token_refresh_status = "token_expired_recovery_failed"
                                 self._clear_pending_slider_success_notice("恢复流程失败")
                                 # 标记已发送通知，避免重复通知
@@ -6902,6 +6954,22 @@ class XianyuLive:
             else:
                 login_error = getattr(slider, 'last_login_error', '') or "密码登录失败，未获取到Cookie"
                 self.last_token_refresh_error_message = login_error
+                if await self._protect_account_from_risk_login_retry(login_error):
+                    if refresh_risk_log_id:
+                        self._update_risk_log(
+                            refresh_risk_log_id,
+                            session_id=risk_session_id,
+                            trigger_scene=trigger_scene,
+                            result_code='account_risk_protected',
+                            processing_status='failed',
+                            error_message=login_error[:200],
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=self._build_risk_event_meta(
+                                trigger_scene=trigger_scene,
+                                extra={**base_event_meta, 'status_note': '风控保护中'},
+                            ),
+                        )
+                    return False
                 backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(login_error)
                 XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
                 logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie: {login_error}")
@@ -6923,6 +6991,22 @@ class XianyuLive:
                 return False
 
         except Exception as refresh_e:
+            if await self._protect_account_from_risk_login_retry(str(refresh_e)):
+                if refresh_risk_log_id:
+                    self._update_risk_log(
+                        refresh_risk_log_id,
+                        session_id=risk_session_id,
+                        trigger_scene=trigger_scene,
+                        result_code='account_risk_protected',
+                        processing_status='failed',
+                        error_message=str(refresh_e)[:200],
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=self._build_risk_event_meta(
+                            trigger_scene=trigger_scene,
+                            extra={**base_event_meta, 'status_note': '风控保护中'},
+                        ),
+                    )
+                return False
             self.last_token_refresh_error_message = self._safe_str(refresh_e)
             backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(str(refresh_e))
             XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
@@ -9187,6 +9271,9 @@ class XianyuLive:
 
     def _build_scheduled_token_refresh_error_message(self, last_refresh_status: str) -> str:
         """为定时Token刷新失败选择更准确的通知文案。"""
+        if last_refresh_status == "account_risk_protected":
+            return "检测到账号风控，系统已停止自动登录重试，请前往闲鱼APP处理后再手动启用账号"
+
         if last_refresh_status in {"session_expired_after_slider", "session_expired_preflight"}:
             return "Session已过期，系统自动恢复失败，请重新登录"
 

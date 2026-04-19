@@ -2871,6 +2871,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
+        status_note = cookie_details.get('status_note', '') if cookie_details else ''
         username = cookie_details.get('username', '') if cookie_details else ''
         has_password = bool(cookie_details.get('password')) if cookie_details else False
 
@@ -2882,6 +2883,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'auto_confirm': auto_confirm,
             'auto_comment': auto_comment,
             'remark': remark,
+            'status_note': status_note,
             'username': username,
             'has_password': has_password,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
@@ -4891,7 +4893,13 @@ def update_cookie_status(cid: str, status_data: CookieStatusIn, current_user: Di
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         cookie_manager.manager.update_cookie_status(cid, status_data.enabled)
-        return {'msg': 'status updated', 'enabled': status_data.enabled}
+        status_note = ''
+        if status_data.enabled:
+            db_manager.update_cookie_status_note(cid, '')
+        else:
+            cookie_details = db_manager.get_cookie_details(cid)
+            status_note = cookie_details.get('status_note', '') if cookie_details else ''
+        return {'msg': 'status updated', 'enabled': status_data.enabled, 'status_note': status_note}
     except HTTPException:
         raise
     except Exception as e:

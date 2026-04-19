@@ -71,6 +71,24 @@ input:checked + .status-slider:before {
   border: 1px solid #fecaca;
 }
 
+.account-status-note-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  background: #fff7ed;
+  color: #b45309;
+  border: 1px solid #fdba74;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.account-status-note-badge .bi {
+  font-size: 0.8rem;
+}
+
 .account-row.disabled {
   opacity: 0.6;
   background-color: #f9fafb;
@@ -1211,6 +1229,12 @@ input:checked + .status-slider:before {
   background: rgba(239, 68, 68, 0.2);
   color: #fca5a5;
   border-color: rgba(239, 68, 68, 0.3);
+}
+
+[data-theme="dark"] .account-status-note-badge {
+  background: rgba(245, 158, 11, 0.16);
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.32);
 }
 
 /* 禁用账号提示 */

@@ -872,6 +872,20 @@ function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
     `;
 }
 
+function renderStatusNoteBadge(statusNote, className) {
+    const noteText = String(statusNote || '').trim();
+    if (!noteText) {
+        return '';
+    }
+    const safeClassName = className || 'account-status-note-badge';
+    return `
+        <span class="${safeClassName}" title="${escapeHtml(noteText)}">
+            <i class="bi bi-shield-exclamation"></i>
+            ${escapeHtml(noteText)}
+        </span>
+    `;
+}
+
 function renderDashboardAccountCard(account) {
     const isEnabled = account.enabled === undefined ? true : account.enabled;
     const keywordCount = account.keywordCount || 0;
@@ -884,6 +898,7 @@ function renderDashboardAccountCard(account) {
     const pauseDuration = account.pause_duration === 0 ? '不暂停' : `${account.pause_duration || 10} 分钟`;
     const polishSchedule = account.polishSchedule;
     const remarkText = account.remark || '';
+    const statusNoteText = String(account.status_note || '').trim();
 
     let replyModeText = '未开启';
     let replyModeTone = 'off';
@@ -972,6 +987,7 @@ function renderDashboardAccountCard(account) {
                         <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'pause-circle-fill'}"></i>
                         ${isEnabled ? '启用中' : '已禁用'}
                     </span>
+                    ${renderStatusNoteBadge(statusNoteText, 'dashboard-account-status-note')}
                 </div>
             </div>
             <div class="dashboard-account-main-metrics">${metrics}</div>
@@ -993,6 +1009,7 @@ function renderDashboardAccountOverview(accounts, totalItems = 0) {
 
     const enabledAccounts = accounts.filter(account => account.enabled === undefined ? true : account.enabled);
     const disabledAccounts = accounts.filter(account => !(account.enabled === undefined ? true : account.enabled));
+    const riskProtectedAccounts = disabledAccounts.filter(account => String(account.status_note || '').trim()).length;
     const activeKeywordAccounts = enabledAccounts.filter(account => (account.keywordCount || 0) > 0).length;
     const totalKeywords = enabledAccounts.reduce((sum, account) => sum + (account.keywordCount || 0), 0);
 
@@ -1004,7 +1021,9 @@ function renderDashboardAccountOverview(accounts, totalItems = 0) {
     ].map(([label, value, tone, details]) => renderDashboardSummaryCard(label, value, tone, details)).join('');
 
     enabledHint.textContent = `${enabledAccounts.length} 个账号`;
-    disabledHint.textContent = disabledAccounts.length ? `${disabledAccounts.length} 个账号待恢复` : '暂无禁用账号';
+    disabledHint.textContent = disabledAccounts.length
+        ? `${disabledAccounts.length} 个账号待恢复${riskProtectedAccounts ? `，其中 ${riskProtectedAccounts} 个处于风控保护中` : ''}`
+        : '暂无禁用账号';
 
     const sortAccounts = (items) => [...items].sort((a, b) => {
         const keywordDiff = (b.keywordCount || 0) - (a.keywordCount || 0);
@@ -1081,7 +1100,14 @@ async function refreshDashboardRuntimeSnapshots() {
     try {
         const cookieDetails = await fetchJSON(`${apiBase}/cookies/details`);
         const runtimeStatusMap = new Map(
-            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [String(cookie.id), cookie.runtime_status || null])
+            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [
+                String(cookie.id),
+                {
+                    runtime_status: cookie.runtime_status || null,
+                    enabled: cookie.enabled,
+                    status_note: cookie.status_note || '',
+                }
+            ])
         );
 
         dashboardData.accounts = dashboardData.accounts.map(account => {
@@ -1089,9 +1115,12 @@ async function refreshDashboardRuntimeSnapshots() {
             if (!runtimeStatusMap.has(accountId)) {
                 return account;
             }
+            const latestDetail = runtimeStatusMap.get(accountId);
             return {
                 ...account,
-                runtime_status: runtimeStatusMap.get(accountId),
+                runtime_status: latestDetail.runtime_status,
+                enabled: latestDetail.enabled,
+                status_note: latestDetail.status_note,
             };
         });
 
@@ -4110,6 +4139,7 @@ async function loadCookies() {
     accountsWithKeywords.forEach(cookie => {
         // 使用数据库中的实际状态，默认为启用
         const isEnabled = cookie.enabled === undefined ? true : cookie.enabled;
+        const statusNoteBadge = renderStatusNoteBadge(cookie.status_note, 'account-status-note-badge');
 
         console.log(`账号 ${cookie.id} 状态: enabled=${cookie.enabled}, isEnabled=${isEnabled}`); // 调试信息
 
@@ -4149,7 +4179,7 @@ async function loadCookies() {
             </span>
         </td>
         <td class="align-middle">
-            <div class="d-flex align-items-center gap-2">
+            <div class="d-flex align-items-center gap-2 flex-wrap account-status-cell">
             <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
                 <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
                 <span class="status-slider"></span>
@@ -4157,6 +4187,7 @@ async function loadCookies() {
             <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
                 <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
             </span>
+            ${statusNoteBadge}
             </div>
         </td>
         <td class="align-middle">
@@ -4706,16 +4737,20 @@ async function toggleAccountStatus(accountId, enabled) {
     });
 
     if (response.ok) {
+        const result = await response.json();
         showToast(`账号 "${accountId}" 已${enabled ? '启用' : '禁用'}`, 'success');
 
         // 清除相关缓存，确保数据一致性
         clearKeywordCache();
 
         // 更新界面显示
-        updateAccountRowStatus(accountId, enabled);
+        updateAccountRowStatus(accountId, enabled, result.status_note || '');
 
         // 刷新自动回复页面的账号列表
         refreshAccountList();
+        if (dashboardData.accounts.length) {
+            await refreshDashboardRuntimeSnapshots();
+        }
 
         // 如果禁用的账号在自动回复页面被选中，更新显示
         const accountSelect = document.getElementById('accountSelect');
@@ -4756,12 +4791,13 @@ async function toggleAccountStatus(accountId, enabled) {
 }
 
 // 更新账号行的状态显示
-function updateAccountRowStatus(accountId, enabled) {
+function updateAccountRowStatus(accountId, enabled, statusNote = '') {
     const toggle = document.querySelector(`input[onchange*="${accountId}"]`);
     if (!toggle) return;
 
     const row = toggle.closest('tr');
     const statusBadge = row.querySelector('.status-badge');
+    const statusCell = row.querySelector('.account-status-cell');
     const actionButtons = row.querySelectorAll('.btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
 
     // 更新行样式
@@ -4773,6 +4809,15 @@ function updateAccountRowStatus(accountId, enabled) {
     statusBadge.innerHTML = `
     <i class="bi bi-${enabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
     `;
+
+    const existingStatusNote = statusCell?.querySelector('.account-status-note-badge');
+    const renderedStatusNote = renderStatusNoteBadge(statusNote, 'account-status-note-badge').trim();
+    if (existingStatusNote) {
+        existingStatusNote.remove();
+    }
+    if (statusCell && renderedStatusNote) {
+        statusCell.insertAdjacentHTML('beforeend', renderedStatusNote);
+    }
 
     // 更新按钮状态（只禁用编辑Cookie按钮，其他按钮保持可用）
     actionButtons.forEach(btn => {
@@ -17708,7 +17753,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.9.2';
+const DEFAULT_VERSION = 'v1.9.3';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -17819,9 +17864,19 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.9.2',
+    version: 'v1.9.3',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.9.3',
+            date: '2026-04-15',
+            updates: [
+                '【新功能】新增账号风控保护状态，检测到高风险登录提示时自动禁用账号并同步展示保护状态',
+                '【修复】命中“账号存在风险 / 请前往闲鱼客户端处理”等提示后立即停止后续自动登录重试，避免持续触发更强风控',
+                '【修复】后端补充账号 status_note 状态说明字段，禁用接口和账号详情接口统一返回保护状态，重新启用账号时自动清空',
+                '【优化】账号列表和仪表盘新增风控保护徽标与待恢复统计提示，便于快速识别需要去闲鱼客户端处理的账号'
+            ]
+        },
         {
             version: 'v1.9.2',
             date: '2026-04-10',

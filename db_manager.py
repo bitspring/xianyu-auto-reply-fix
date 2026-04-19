@@ -324,6 +324,7 @@ class DBManager:
                 user_id INTEGER NOT NULL,
                 auto_confirm INTEGER DEFAULT 1,
                 remark TEXT DEFAULT '',
+                status_note TEXT DEFAULT '',
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -936,6 +937,11 @@ Cookie数量: {cookie_count}
                 logger.info("添加cookies表的remark列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN remark TEXT DEFAULT ''")
                 logger.info("数据库迁移完成：添加remark列")
+
+            if 'status_note' not in cookie_columns:
+                logger.info("添加cookies表的status_note列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN status_note TEXT DEFAULT ''")
+                logger.info("数据库迁移完成：添加status_note列")
 
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
@@ -2044,37 +2050,38 @@ Cookie数量: {cookie_count}
                 return None
 
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
-        """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password、show_browser和代理配置"""
+        """获取Cookie的详细信息，包括备注、状态文案、暂停时间、账号信息和代理配置"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, """
-                    SELECT id, value, user_id, auto_confirm, remark, pause_duration, 
-                           username, password, show_browser, created_at,
+                    SELECT id, value, user_id, auto_confirm, remark, status_note,
+                           pause_duration, username, password, show_browser, created_at,
                            proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
                     FROM cookies WHERE id = ?
                 """, (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     cookie_value = self._decrypt_secret(result[1])
-                    password = self._decrypt_secret(result[7])
-                    proxy_pass = self._decrypt_secret(result[14])
+                    password = self._decrypt_secret(result[8])
+                    proxy_pass = self._decrypt_secret(result[15])
                     return {
                         'id': result[0],
                         'value': cookie_value,
                         'user_id': result[2],
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
-                        'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
-                        'username': result[6] or '',
+                        'status_note': result[5] or '',
+                        'pause_duration': result[6] if result[6] is not None else 10,  # 0是有效值，表示不暂停
+                        'username': result[7] or '',
                         'password': password,
-                        'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9],
+                        'show_browser': bool(result[9]) if result[9] is not None else False,
+                        'created_at': result[10],
                         # 代理配置
-                        'proxy_type': result[10] or 'none',
-                        'proxy_host': result[11] or '',
-                        'proxy_port': result[12] or 0,
-                        'proxy_user': result[13] or '',
+                        'proxy_type': result[11] or 'none',
+                        'proxy_host': result[12] or '',
+                        'proxy_port': result[13] or 0,
+                        'proxy_user': result[14] or '',
                         'proxy_pass': proxy_pass
                     }
                 return None
@@ -2106,6 +2113,19 @@ Cookie数量: {cookie_count}
                 return True
             except Exception as e:
                 logger.error(f"更新账号备注失败: {e}")
+                return False
+
+    def update_cookie_status_note(self, cookie_id: str, status_note: str) -> bool:
+        """更新Cookie的状态说明文案"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET status_note = ? WHERE id = ?", (status_note, cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 状态文案: {status_note}")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号状态文案失败: {e}")
                 return False
 
     def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:
